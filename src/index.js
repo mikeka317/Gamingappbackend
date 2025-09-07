@@ -39,7 +39,7 @@ const corsOptions = {
       'http://localhost:8080',
       'http://localhost:5072',
       'http://localhost:5173',
-      'https://cyber-duel-grid.vercel.app'
+      'https://gamingappfrontend-2.onrender.com/'
     ];
     
     // console.log('🌐 CORS: Request origin:', origin);
