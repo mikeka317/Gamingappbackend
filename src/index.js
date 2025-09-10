@@ -23,7 +23,7 @@ const stripeRoutes = require('./routes/stripe');
 
 
 const app = express();
-const PORT = process.env.PORT || 5072;
+const PORT = process.env.PORT || 5402;
 
 // Security middleware
 // app.use(helmet()); // Temporarily disabled for CORS debugging
@@ -39,7 +39,7 @@ const corsOptions = {
       'http://localhost:8080',
       'http://localhost:5072',
       'http://localhost:5173',
-      'https://gamingappfrontend-2.onrender.com'
+      'https://gamingappfrontend-3.onrender.com'
     ];
     
     // console.log('🌐 CORS: Request origin:', origin);
