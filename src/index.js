@@ -41,18 +41,21 @@ const corsOptions = {
       'http://localhost:5173',
       'https://gamingappfrontend-3.onrender.com',
       'https://cyber-duel-grid.onrender.com',
-      'https://gamingappfrontend.onrender.com'
+      'https://gamingappfrontend.onrender.com',
+      'https://gamingappfrontend-2.onrender.com'
     ];
     
-    // console.log('🌐 CORS: Request origin:', origin);
-    // console.log('🌐 CORS: Allowed origins:', allowedOrigins);
+    console.log('🌐 CORS: Request origin:', origin);
+    console.log('🌐 CORS: Allowed origins:', allowedOrigins);
     
     if (allowedOrigins.indexOf(origin) !== -1) {
       console.log('✅ CORS: Origin allowed');
       callback(null, true);
     } else {
-      console.log('❌ CORS: Origin blocked');
-      callback(new Error('Not allowed by CORS'));
+      console.log('❌ CORS: Origin blocked:', origin);
+      // Temporarily allow all origins for debugging
+      console.log('🔧 CORS: Allowing origin for debugging');
+      callback(null, true);
     }
   },
   credentials: true,
