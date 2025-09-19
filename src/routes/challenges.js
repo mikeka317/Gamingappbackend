@@ -1,4 +1,5 @@
 const express = require('express');
+const multer = require('multer');
 const router = express.Router();
 const { authenticateToken } = require('../middleware/auth');
 const { firestore } = require('../config/firebase');
@@ -7,6 +8,85 @@ const UserService = require('../services/userService');
 
 const walletService = new WalletService();
 const userService = new UserService();
+
+// Function to automatically fix "Unknown" winners in existing challenges
+async function autoFixUnknownWinners() {
+  try {
+    console.log('🔍 Auto-checking for challenges with "Unknown" winner...');
+    
+    const challengesRef = firestore.collection('challenges');
+    const snapshot = await challengesRef
+      .where('winner', '==', 'Unknown')
+      .where('aiVerificationResults', '!=', null)
+      .get();
+    
+    if (snapshot.empty) {
+      console.log('✅ No challenges with "Unknown" winner found');
+      return;
+    }
+    
+    console.log(`📊 Found ${snapshot.size} challenges with "Unknown" winner`);
+    
+    const batch = firestore.batch();
+    let fixedCount = 0;
+    
+    snapshot.forEach(doc => {
+      const data = doc.data();
+      
+      // Check if we have AI verification results with score data
+      if (data.aiVerificationResults && data.aiVerificationResults.length > 0) {
+        let scoreBasedWinner = null;
+        
+        // Look for score data in AI verification results
+        for (const result of data.aiVerificationResults) {
+          if (result.players && result.players.length > 0) {
+            const playerScores = {};
+            result.players.forEach(player => {
+              const [name, score] = player.split(':');
+              if (name && score) {
+                playerScores[name.trim()] = parseInt(score.trim());
+              }
+            });
+            
+            if (Object.keys(playerScores).length === 2) {
+              const scores = Object.values(playerScores);
+              const names = Object.keys(playerScores);
+              const maxScore = Math.max(...scores);
+              const winnerIndex = scores.indexOf(maxScore);
+              scoreBasedWinner = names[winnerIndex];
+              break;
+            }
+          }
+        }
+        
+        if (scoreBasedWinner) {
+          console.log(`🔧 Auto-fixing challenge ${doc.id}: Setting winner to ${scoreBasedWinner}`);
+          
+          batch.update(doc.ref, {
+            winner: scoreBasedWinner,
+            status: 'completed',
+            completedAt: new Date(),
+            updatedAt: new Date(),
+            autoFixed: true,
+            autoFixedAt: new Date()
+          });
+          
+          fixedCount++;
+        }
+      }
+    });
+    
+    if (fixedCount > 0) {
+      await batch.commit();
+      console.log(`✅ Auto-fixed ${fixedCount} challenges with "Unknown" winner`);
+    } else {
+      console.log('ℹ️ No challenges could be auto-fixed (no valid score data)');
+    }
+    
+  } catch (error) {
+    console.error('❌ Error in auto-fix unknown winners:', error.message);
+  }
+}
 
 // Real AI analysis using OpenAI Vision API
 async function performAIAnalysis(challengeData, proofImages, proofDescription, platformUsernames) {
@@ -183,6 +263,12 @@ async function performAIAnalysis(challengeData, proofImages, proofDescription, p
     }
 
     // CRITICAL: Validate AI winner determination against detected scores
+    console.log('🔍 Score validation section - AI result:', {
+      winner: result.winner,
+      score: result.score,
+      players: result.players
+    });
+    
     if (result.winner && result.score) {
       console.log('🔍 Validating AI winner determination against scores...');
       console.log('  - AI detected winner:', result.winner);
@@ -208,6 +294,105 @@ async function performAIAnalysis(challengeData, proofImages, proofDescription, p
           console.warn('⚠️ AI winner determination may be incorrect based on scores');
           console.warn('  - AI says winner is:', result.winner);
           console.warn('  - But scores suggest winner should have score:', actualWinner);
+        }
+        
+        // CRITICAL: Apply score-based winner correction
+        if (result.winner === 'Unknown' || !result.winner) {
+          console.log('🔍 Applying score-based winner correction...');
+          console.log('  - Score1:', score1, 'Score2:', score2);
+          console.log('  - Players array:', result.players);
+          
+          // Find the player with the higher score
+          let scoreBasedWinner = 'Unknown';
+          
+          if (result.players && result.players.length >= 2) {
+            // Parse scores from players array
+            const player1Score = parseInt(result.players[0].split(':')[1]) || 0;
+            const player2Score = parseInt(result.players[1].split(':')[1]) || 0;
+            const player1Name = result.players[0].split(':')[0].trim();
+            const player2Name = result.players[1].split(':')[0].trim();
+            
+            console.log('  - Player1:', player1Name, 'Score:', player1Score);
+            console.log('  - Player2:', player2Name, 'Score:', player2Score);
+            
+            // Determine winner based on actual scores from players array
+            if (player1Score > player2Score) {
+              scoreBasedWinner = player1Name;
+            } else if (player2Score > player1Score) {
+              scoreBasedWinner = player2Name;
+            } else {
+              console.log('  - Scores are equal, cannot determine winner');
+            }
+          } else {
+            // Fallback: use the score comparison from the score field
+            scoreBasedWinner = score1 > score2 ? 'Player1' : 'Player2';
+          }
+          
+          if (scoreBasedWinner !== 'Unknown') {
+            result.winner = scoreBasedWinner;
+            result.scoreCorrected = true;
+            console.log('✅ Score-based winner correction applied:', scoreBasedWinner);
+          } else {
+            console.log('⚠️ Could not determine winner from scores');
+          }
+        } else {
+          // Even if AI detected a winner, let's validate it against scores
+          console.log('🔍 Validating AI winner against scores...');
+          console.log('  - AI winner:', result.winner);
+          console.log('  - Players array:', result.players);
+          
+          if (result.players && result.players.length >= 2) {
+            const player1Score = parseInt(result.players[0].split(':')[1]) || 0;
+            const player2Score = parseInt(result.players[1].split(':')[1]) || 0;
+            const player1Name = result.players[0].split(':')[0].trim();
+            const player2Name = result.players[1].split(':')[0].trim();
+            
+            console.log('  - Player1:', player1Name, 'Score:', player1Score);
+            console.log('  - Player2:', player2Name, 'Score:', player2Score);
+            
+            // Check if AI winner matches the actual higher scorer
+            const actualWinner = player1Score > player2Score ? player1Name : player2Name;
+            if (result.winner !== actualWinner) {
+              console.warn('⚠️ AI winner does not match score-based winner, correcting...');
+              console.warn('  - AI says:', result.winner);
+              console.warn('  - Score says:', actualWinner);
+              result.winner = actualWinner;
+              result.scoreCorrected = true;
+              console.log('✅ Winner corrected based on scores:', actualWinner);
+            }
+          }
+        }
+      } else {
+        console.log('🔍 No score field found, checking players array...');
+        // Try to extract scores from players array if no score field
+        if (result.players && result.players.length >= 2) {
+          const player1Score = parseInt(result.players[0].split(':')[1]) || 0;
+          const player2Score = parseInt(result.players[1].split(':')[1]) || 0;
+          const player1Name = result.players[0].split(':')[0].trim();
+          const player2Name = result.players[1].split(':')[0].trim();
+          
+          console.log('🔍 Players array analysis:', {
+            player1: player1Name,
+            player1Score: player1Score,
+            player2: player2Name,
+            player2Score: player2Score
+          });
+          
+          // Apply score correction if winner is Unknown
+          if (result.winner === 'Unknown' || !result.winner) {
+            let scoreBasedWinner = 'Unknown';
+            if (player1Score > player2Score) {
+              scoreBasedWinner = player1Name;
+            } else if (player2Score > player1Score) {
+              scoreBasedWinner = player2Name;
+            }
+            
+            if (scoreBasedWinner !== 'Unknown') {
+              result.winner = scoreBasedWinner;
+              result.scoreCorrected = true;
+              console.log('✅ Score-based winner correction applied from players array:', scoreBasedWinner);
+            }
+          }
         }
       }
     }
@@ -352,37 +537,73 @@ async function performAIAnalysis(challengeData, proofImages, proofDescription, p
               iWin = true;
             } else {
               // Multiple usernames or current user not found as winner
-              winner = 'Unknown';
-              confidence = 0.6;
-              let gameTypeNote = '';
-              if (result.gameType && result.gameType.toLowerCase() !== gameType.toLowerCase()) {
-                gameTypeNote = ` Note: Image shows ${result.gameType} but challenge was for ${gameType}.`;
+              // Check if we have a score-based winner from earlier correction
+              if (result.winner && result.winner !== 'Unknown' && result.scoreCorrected) {
+                winner = result.winner;
+                confidence = 0.8;
+                let gameTypeNote = '';
+                if (result.gameType && result.gameType.toLowerCase() !== gameType.toLowerCase()) {
+                  gameTypeNote = ` Note: Image shows ${result.gameType} but challenge was for ${gameType}.`;
+                }
+                reasoning = `Winner determined from score analysis: ${result.winner}.${gameTypeNote}`;
+                iWin = result.winner.toLowerCase() === currentUser.toLowerCase();
+              } else {
+                winner = 'Unknown';
+                confidence = 0.6;
+                let gameTypeNote = '';
+                if (result.gameType && result.gameType.toLowerCase() !== gameType.toLowerCase()) {
+                  gameTypeNote = ` Note: Image shows ${result.gameType} but challenge was for ${gameType}.`;
+                }
+                reasoning = `Multiple usernames found but no clear winner. Current user "${currentUser}" may not be the winner.${gameTypeNote}`;
+                iWin = false;
               }
-              reasoning = `Multiple usernames found but no clear winner. Current user "${currentUser}" may not be the winner.${gameTypeNote}`;
-              iWin = false;
             }
           }
         } else {
                   // Current user's username not found in image - this is suspicious
-        winner = 'Unknown';
-        confidence = 0.3;
-        let gameTypeNote = '';
-        if (result.gameType && result.gameType.toLowerCase() !== gameType.toLowerCase()) {
-          gameTypeNote = ` Note: Image shows ${result.gameType} but challenge was for ${gameType}.`;
+        // Check if we have a score-based winner from earlier correction
+        if (result.winner && result.winner !== 'Unknown' && result.scoreCorrected) {
+          winner = result.winner;
+          confidence = 0.7;
+          let gameTypeNote = '';
+          if (result.gameType && result.gameType.toLowerCase() !== gameType.toLowerCase()) {
+            gameTypeNote = ` Note: Image shows ${result.gameType} but challenge was for ${gameType}.`;
+          }
+          reasoning = `Winner determined from score analysis: ${result.winner}. Current user "${currentUser}" not found in image but score shows clear winner.${gameTypeNote}`;
+          iWin = result.winner.toLowerCase() === currentUser.toLowerCase();
+        } else {
+          winner = 'Unknown';
+          confidence = 0.3;
+          let gameTypeNote = '';
+          if (result.gameType && result.gameType.toLowerCase() !== gameType.toLowerCase()) {
+            gameTypeNote = ` Note: Image shows ${result.gameType} but challenge was for ${gameType}.`;
+          }
+          reasoning = `Current user "${currentUser}" not found in the image despite submitting proof. This may indicate invalid proof.${gameTypeNote}`;
+          iWin = false;
         }
-        reasoning = `Current user "${currentUser}" not found in the image despite submitting proof. This may indicate invalid proof.${gameTypeNote}`;
-        iWin = false;
         }
       } else {
         // No username matches found - this is also suspicious
-        winner = 'Unknown';
-        confidence = 0.2;
-        let gameTypeNote = '';
-        if (result.gameType && result.gameType.toLowerCase() !== gameType.toLowerCase()) {
-          gameTypeNote = ` Note: Image shows ${result.gameType} but challenge was for ${gameType}.`;
+        // Check if we have a score-based winner from earlier correction
+        if (result.winner && result.winner !== 'Unknown' && result.scoreCorrected) {
+          winner = result.winner;
+          confidence = 0.6;
+          let gameTypeNote = '';
+          if (result.gameType && result.gameType.toLowerCase() !== gameType.toLowerCase()) {
+            gameTypeNote = ` Note: Image shows ${result.gameType} but challenge was for ${gameType}.`;
+          }
+          reasoning = `Winner determined from score analysis: ${result.winner}. No platform usernames match detected usernames but score shows clear winner.${gameTypeNote}`;
+          iWin = result.winner.toLowerCase() === currentUser.toLowerCase();
+        } else {
+          winner = 'Unknown';
+          confidence = 0.2;
+          let gameTypeNote = '';
+          if (result.gameType && result.gameType.toLowerCase() !== gameType.toLowerCase()) {
+            gameTypeNote = ` Note: Image shows ${result.gameType} but challenge was for ${gameType}.`;
+          }
+          reasoning = `No platform usernames match the detected usernames in the image. Proof may be invalid or from different game.${gameTypeNote}`;
+          iWin = false;
         }
-        reasoning = `No platform usernames match the detected usernames in the image. Proof may be invalid or from different game.${gameTypeNote}`;
-        iWin = false;
       }
     } else {
       // No platform usernames or detected usernames - this is problematic
@@ -411,15 +632,27 @@ async function performAIAnalysis(challengeData, proofImages, proofDescription, p
           iWin = false;
         }
       } else {
-        // No clear evidence - reject the proof
-        winner = 'Unknown';
-        confidence = 0.1;
-        let gameTypeNote = '';
-        if (result.gameType && result.gameType.toLowerCase() !== gameType.toLowerCase()) {
-          gameTypeNote = ` Note: Image shows ${result.gameType} but challenge was for ${gameType}.`;
+        // No clear evidence - check if we have score-based winner
+        if (result.winner && result.winner !== 'Unknown' && result.scoreCorrected) {
+          winner = result.winner;
+          confidence = 0.5;
+          let gameTypeNote = '';
+          if (result.gameType && result.gameType.toLowerCase() !== gameType.toLowerCase()) {
+            gameTypeNote = ` Note: Image shows ${result.gameType} but challenge was for ${gameType}.`;
+          }
+          reasoning = `Winner determined from score analysis: ${result.winner}. No platform usernames provided but score shows clear winner.${gameTypeNote}`;
+          iWin = result.winner.toLowerCase() === currentUser.toLowerCase();
+        } else {
+          // No clear evidence - reject the proof
+          winner = 'Unknown';
+          confidence = 0.1;
+          let gameTypeNote = '';
+          if (result.gameType && result.gameType.toLowerCase() !== gameType.toLowerCase()) {
+            gameTypeNote = ` Note: Image shows ${result.gameType} but challenge was for ${gameType}.`;
+          }
+          reasoning = `No clear evidence of winner and no platform usernames provided. Cannot verify proof validity.${gameTypeNote}`;
+          iWin = false;
         }
-        reasoning = `No clear evidence of winner and no platform usernames provided. Cannot verify proof validity.${gameTypeNote}`;
-        iWin = false;
       }
     }
     
@@ -573,6 +806,23 @@ async function performAIAnalysis(challengeData, proofImages, proofDescription, p
     };
   }
 }
+
+// Root endpoint for challenges
+router.get('/', (req, res) => {
+  res.json({
+    success: true,
+    message: 'Challenges API is working',
+    availableEndpoints: [
+      'GET /test - Test endpoint',
+      'GET /my-challenges - Get user\'s challenges',
+      'GET /for-me - Get challenges for user as opponent',
+      'GET /public - Get public challenges',
+      'GET /:id - Get specific challenge',
+      'POST / - Create new challenge'
+    ],
+    timestamp: new Date().toISOString()
+  });
+});
 
 // Test endpoint to verify route is accessible
 router.get('/test', (req, res) => {
@@ -791,6 +1041,9 @@ router.post('/', authenticateToken, async (req, res) => {
 // Get all challenges for the authenticated user
 router.get('/my-challenges', authenticateToken, async (req, res) => {
   try {
+    // Run auto-fix in background (don't wait for it)
+    autoFixUnknownWinners().catch(console.error);
+    
     console.log('🎯 Fetching challenges for user:', req.user.uid);
     
     const challengesRef = firestore.collection('challenges');
@@ -882,6 +1135,9 @@ router.get('/public', async (req, res) => {
 // Get challenges for the authenticated user (where they are the opponent)
 router.get('/for-me', authenticateToken, async (req, res) => {
   try {
+    // Run auto-fix in background (don't wait for it)
+    autoFixUnknownWinners().catch(console.error);
+    
     console.log('🎯 Fetching challenges for user (as opponent):', req.user.uid);
     console.log('🎯 Looking for username:', req.user.username);
     
@@ -1456,7 +1712,7 @@ router.put('/:id/respond', authenticateToken, async (req, res) => {
     let newStatus = challengeData.status;
     if (allResponded) {
       if (allAccepted) {
-        newStatus = 'active';
+        newStatus = 'ready-pending'; // Changed from 'active' to 'ready-pending'
       } else {
         newStatus = 'cancelled';
       }
@@ -1514,6 +1770,331 @@ router.put('/:id/respond', authenticateToken, async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Failed to respond to challenge',
+      error: error.message
+    });
+  }
+});
+
+// Mark ready for challenge
+router.put('/:id/ready', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log('🎯 User marking ready for challenge:', id, 'User:', req.user.username);
+
+    const challengeRef = firestore.collection('challenges').doc(id);
+    const challengeDoc = await challengeRef.get();
+    
+    if (!challengeDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        message: 'Challenge not found'
+      });
+    }
+
+    const challengeData = challengeDoc.data();
+    
+    // Check if challenge is in ready-pending status
+    if (challengeData.status !== 'ready-pending') {
+      return res.status(400).json({
+        success: false,
+        message: 'Challenge is not in ready-pending status'
+      });
+    }
+
+    // Check if user is part of this challenge
+    const isChallenger = challengeData.challenger.uid === req.user.uid;
+    const opponentIndex = challengeData.opponents.findIndex(opp => opp.username === req.user.username);
+    
+    if (!isChallenger && opponentIndex === -1) {
+      return res.status(403).json({
+        success: false,
+        message: 'You are not part of this challenge'
+      });
+    }
+
+    // Update ready status
+    const updatedOpponents = [...challengeData.opponents];
+    if (isChallenger) {
+      // Update challenger ready status
+      const updatedChallenger = {
+        ...challengeData.challenger,
+        ready: true,
+        readyAt: new Date()
+      };
+      
+      const updateData = {
+        challenger: updatedChallenger,
+        updatedAt: new Date()
+      };
+      
+      await challengeRef.update(updateData);
+    } else {
+      // Update opponent ready status
+      updatedOpponents[opponentIndex] = {
+        ...updatedOpponents[opponentIndex],
+        ready: true,
+        readyAt: new Date()
+      };
+      
+      const updateData = {
+        opponents: updatedOpponents,
+        updatedAt: new Date()
+      };
+      
+      await challengeRef.update(updateData);
+    }
+
+    // Check if all participants are ready
+    const challengerReady = isChallenger ? true : challengeData.challenger.ready;
+    const allOpponentsReady = updatedOpponents.every(opp => opp.ready === true);
+    
+    if (challengerReady && allOpponentsReady) {
+      // All participants are ready, change status to active
+      await challengeRef.update({
+        status: 'active',
+        gameStartedAt: new Date(),
+        updatedAt: new Date()
+      });
+      
+      console.log('✅ All participants ready, challenge is now active');
+    }
+
+    res.json({
+      success: true,
+      message: 'Ready status updated successfully',
+      data: {
+        ready: true,
+        allReady: challengerReady && allOpponentsReady
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Error marking ready:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to mark ready',
+      error: error.message
+    });
+  }
+});
+
+// Check AI verification timer status
+router.get('/:id/ai-timer-status', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const challengeRef = firestore.collection('challenges').doc(id);
+    const challengeDoc = await challengeRef.get();
+    
+    if (!challengeDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        message: 'Challenge not found'
+      });
+    }
+
+    const challengeData = challengeDoc.data();
+    
+    // Only show timer for ai-verification-pending challenges
+    if (challengeData.status !== 'ai-verification-pending') {
+      console.log('⏰ Challenge not in ai-verification-pending status:', challengeData.status);
+      return res.json({
+        success: true,
+        data: {
+          hasTimer: false,
+          timeRemaining: 0,
+          timerExpired: false
+        }
+      });
+    }
+
+    if (!challengeData.aiVerificationTimerEnd) {
+      console.log('⏰ No aiVerificationTimerEnd found for ai-verification-pending challenge');
+      return res.json({
+        success: true,
+        data: {
+          hasTimer: false,
+          timeRemaining: 0,
+          timerExpired: false
+        }
+      });
+    }
+
+    const now = Date.now();
+    const timerEnd = challengeData.aiVerificationTimerEnd; // This is already a timestamp
+    const timeRemaining = Math.max(0, timerEnd - now);
+    const timerExpired = timeRemaining === 0;
+    
+    console.log('⏰ AI Verification Timer calculation:', {
+      now: new Date(now),
+      timerEnd: new Date(timerEnd),
+      timeRemaining: timeRemaining,
+      timeRemainingMinutes: Math.floor(timeRemaining / 60000),
+      timerExpired
+    });
+
+    // If timer expired, check if we need to auto-forfeit
+    if (timerExpired && challengeData.status === 'ai-verification-pending') {
+      const submittedUsernames = challengeData.aiVerificationResults.map(ai => ai.submittedBy);
+      const allParticipants = [challengeData.challenger.username, ...challengeData.opponents.map(opp => opp.username)];
+      const notSubmitted = allParticipants.filter(username => !submittedUsernames.includes(username));
+      
+      if (notSubmitted.length > 0) {
+        // Auto-forfeit users who didn't submit AI verification
+        const forfeitData = {
+          status: 'completed',
+          winner: submittedUsernames[0], // First submitter wins
+          completedAt: new Date(),
+          aiVerification: true,
+          autoForfeit: true,
+          forfeitReason: 'AI verification timer expired'
+        };
+        
+        await challengeRef.update(forfeitData);
+        
+        // Process wallet transactions for auto-forfeit
+        const totalChallengeAmount = challengeData.stake * 2;
+        const rewardAmount = totalChallengeAmount * 0.95;
+        const adminFee = totalChallengeAmount * 0.05;
+        
+        // Find winner user ID
+        let winnerUserId = null;
+        if (submittedUsernames[0] === challengeData.challenger.username) {
+          winnerUserId = challengeData.challenger.uid;
+        } else {
+          const winnerOpponent = challengeData.opponents.find(opp => 
+            opp.username === submittedUsernames[0]
+          );
+          if (winnerOpponent) {
+            try {
+              const profile = await userService.getUserByUsername(winnerOpponent.username);
+              winnerUserId = profile.uid;
+            } catch (e) {
+              console.error('Error finding winner user:', e);
+            }
+          }
+        }
+        
+        if (winnerUserId) {
+          await walletService.awardReward(winnerUserId, rewardAmount, id, `Challenge reward for ${challengeData.game} (AI Verification Auto-Forfeit)`);
+          await walletService.addAdminFee(adminFee, id, `Admin fee from challenge ${challengeData.game} (AI Verification Auto-Forfeit)`);
+        }
+        
+        console.log('⏰ AI verification timer expired, auto-forfeited users:', notSubmitted);
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        hasTimer: true,
+        timeRemaining,
+        timerExpired,
+        timerEnd: challengeData.aiVerificationTimerEnd
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Error checking AI verification timer status:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error'
+    });
+  }
+});
+
+// Check scorecard timer status
+router.get('/:id/timer-status', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const challengeRef = firestore.collection('challenges').doc(id);
+    const challengeDoc = await challengeRef.get();
+    
+    if (!challengeDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        message: 'Challenge not found'
+      });
+    }
+
+    const challengeData = challengeDoc.data();
+    
+    // Only show timer for scorecard-pending challenges
+    if (challengeData.status !== 'scorecard-pending') {
+      console.log('⏰ Challenge not in scorecard-pending status:', challengeData.status);
+      return res.json({
+        success: true,
+        data: {
+          hasTimer: false,
+          timeRemaining: 0,
+          timerExpired: false
+        }
+      });
+    }
+
+    if (!challengeData.scorecardTimerEnd) {
+      console.log('⏰ No scorecardTimerEnd found for scorecard-pending challenge');
+      return res.json({
+        success: true,
+        data: {
+          hasTimer: false,
+          timeRemaining: 0,
+          timerExpired: false
+        }
+      });
+    }
+
+    const now = Date.now();
+    const timerEnd = challengeData.scorecardTimerEnd; // This is already a timestamp
+    const timeRemaining = Math.max(0, timerEnd - now);
+    const timerExpired = timeRemaining === 0;
+    
+    console.log('⏰ Timer calculation:', {
+      now: new Date(now),
+      timerEnd: new Date(timerEnd),
+      timeRemaining: timeRemaining,
+      timeRemainingMinutes: Math.floor(timeRemaining / 60000),
+      timerExpired
+    });
+
+    // If timer expired, check if we need to auto-forfeit
+    if (timerExpired && challengeData.status === 'scorecard-pending') {
+      const submittedUsernames = challengeData.scorecards.map(sc => sc.submittedBy);
+      const allParticipants = [challengeData.challenger.username, ...challengeData.opponents.map(opp => opp.username)];
+      const notSubmitted = allParticipants.filter(username => !submittedUsernames.includes(username));
+      
+      if (notSubmitted.length > 0) {
+        // Auto-forfeit users who didn't submit scorecard
+        const forfeitData = {
+          status: 'completed',
+          winner: submittedUsernames[0], // First submitter wins
+          completedAt: new Date(),
+          autoForfeit: true,
+          forfeitedUsers: notSubmitted,
+          updatedAt: new Date()
+        };
+        
+        await challengeRef.update(forfeitData);
+        console.log('⏰ Timer expired, auto-forfeiting users:', notSubmitted);
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        hasTimer: true,
+        timeRemaining,
+        timerExpired,
+        timerEnd: challengeData.scorecardTimerEnd
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Error checking timer status:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to check timer status',
       error: error.message
     });
   }
@@ -1914,6 +2495,1058 @@ router.post('/:id/complete', authenticateToken, async (req, res) => {
       error: error.message
     });
   }
+});
+
+// Submit scorecard for challenge
+router.post('/:id/submit-scorecard', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { playerAScore, playerBScore, playerAPlatformUsername, playerBPlatformUsername, submittedAt } = req.body;
+    
+    console.log('🎯 Submitting scorecard for challenge:', id);
+    console.log('🎯 Scorecard data:', { playerAScore, playerBScore, playerAPlatformUsername, playerBPlatformUsername });
+    console.log('🎯 Raw request body:', req.body);
+    console.log('🎯 Field validation:');
+    console.log('  - playerAScore:', playerAScore, 'type:', typeof playerAScore);
+    console.log('  - playerBScore:', playerBScore, 'type:', typeof playerBScore);
+    console.log('  - playerAPlatformUsername:', playerAPlatformUsername, 'type:', typeof playerAPlatformUsername);
+    console.log('  - playerBPlatformUsername:', playerBPlatformUsername, 'type:', typeof playerBPlatformUsername);
+
+    if (playerAScore === null || playerAScore === undefined || 
+        playerBScore === null || playerBScore === undefined || 
+        !playerAPlatformUsername || !playerBPlatformUsername) {
+      console.log('❌ Validation failed - missing required fields');
+      return res.status(400).json({
+        success: false,
+        message: 'All scorecard fields are required'
+      });
+    }
+
+    const challengeRef = firestore.collection('challenges').doc(id);
+    const challengeDoc = await challengeRef.get();
+
+    if (!challengeDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        message: 'Challenge not found'
+      });
+    }
+
+    const challengeData = challengeDoc.data();
+    console.log('🎯 Current challenge status:', challengeData.status);
+    
+    // Check if user is part of this challenge
+    const isChallenger = challengeData.challenger.uid === req.user.uid;
+    const isOpponent = challengeData.opponents && challengeData.opponents.some(opp => 
+      opp.username === req.user.username
+    );
+
+    if (!isChallenger && !isOpponent) {
+      return res.status(403).json({
+        success: false,
+        message: 'You are not authorized to submit scorecard for this challenge'
+      });
+    }
+
+    // Check if challenge is active or scorecard-pending
+    if (!['active', 'scorecard-pending'].includes(challengeData.status)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Challenge must be active or in scorecard-pending state to submit scorecard'
+      });
+    }
+
+    // Check if this is the first scorecard submission
+    const isFirstScorecard = !challengeData.scorecards || challengeData.scorecards.length === 0;
+
+    // Check if scorecard already submitted by this user
+    const existingScorecard = challengeData.scorecards && challengeData.scorecards.find(sc => 
+      sc.submittedBy === req.user.username
+    );
+
+    if (existingScorecard) {
+      return res.status(400).json({
+        success: false,
+        message: 'You have already submitted a scorecard for this challenge'
+      });
+    }
+
+    const scorecardData = {
+      playerAScore: parseInt(playerAScore),
+      playerBScore: parseInt(playerBScore),
+      playerAPlatformUsername,
+      playerBPlatformUsername,
+      submittedBy: req.user.username,
+      submittedAt: new Date(submittedAt || new Date()),
+      timestamp: Date.now()
+    };
+
+    // Add scorecard to challenge
+    const updatedScorecards = [...(challengeData.scorecards || []), scorecardData];
+    
+    // Check for conflicts
+    const hasConflict = updatedScorecards.length > 1 && 
+      updatedScorecards.some((sc, index) => {
+        if (index === 0) return false;
+        const firstSc = updatedScorecards[0];
+        return sc.playerAScore !== firstSc.playerAScore || sc.playerBScore !== firstSc.playerBScore;
+      });
+
+    let newStatus = challengeData.status;
+    let updateData = {
+      scorecards: updatedScorecards,
+      updatedAt: new Date()
+    };
+
+    // If this is the first scorecard, start the timer
+    if (isFirstScorecard) {
+      const timerEndTime = Date.now() + (5 * 60 * 1000); // 5 minutes from now as timestamp
+      updateData.scorecardTimerEnd = timerEndTime;
+      newStatus = 'scorecard-pending';
+      console.log('⏰ First scorecard submitted, starting 5-minute timer until:', new Date(timerEndTime));
+    }
+
+    if (hasConflict) {
+      // Conflict detected - require proof upload
+      newStatus = 'scorecard-conflict';
+      updateData.status = newStatus;
+      updateData.conflictDetectedAt = new Date();
+      
+      console.log('⚠️ Scorecard conflict detected for challenge:', id);
+    } else if (updatedScorecards.length === 2) {
+      // Both scorecards submitted and no conflict - determine winner
+      const firstScorecard = updatedScorecards[0];
+      const winner = firstScorecard.playerAScore > firstScorecard.playerBScore ? 
+        firstScorecard.playerAPlatformUsername : firstScorecard.playerBPlatformUsername;
+      
+      newStatus = 'completed';
+      updateData.status = newStatus;
+      updateData.winner = winner;
+      updateData.completedAt = new Date();
+      
+      // Process wallet transactions
+      const totalChallengeAmount = challengeData.stake * 2;
+      const rewardAmount = totalChallengeAmount * 0.95;
+      const adminFee = totalChallengeAmount * 0.05;
+      
+      // Find winner user ID
+      let winnerUserId = null;
+      if (winner === challengeData.challengerPlatformUsernames?.[challengeData.platform?.toLowerCase()] || 
+          winner === challengeData.challenger.username) {
+        winnerUserId = challengeData.challenger.uid;
+      } else {
+        // Find in opponents
+        const winnerOpponent = challengeData.opponents.find(opp => 
+          opp.accepterPlatformUsernames?.[challengeData.platform?.toLowerCase()] === winner ||
+          opp.username === winner
+        );
+        if (winnerOpponent) {
+          try {
+            const profile = await userService.getUserByUsername(winnerOpponent.username);
+            winnerUserId = profile.uid;
+          } catch (e) {
+            console.error('Error finding winner user:', e);
+          }
+        }
+      }
+      
+      if (winnerUserId) {
+        await walletService.awardReward(winnerUserId, rewardAmount, id, `Challenge reward for ${challengeData.game}`);
+        await walletService.addAdminFee(adminFee, id, `Admin fee from challenge ${challengeData.game}`);
+      }
+      
+      console.log('✅ Challenge completed with winner:', winner);
+    } else if (updatedScorecards.length === 1) {
+      // First scorecard submitted - start timer for second player
+      newStatus = 'scorecard-pending';
+      updateData.status = newStatus;
+      updateData.scorecardTimerStarted = new Date();
+      
+      console.log('⏰ First scorecard submitted, waiting for second player');
+    } else {
+      // This shouldn't happen, but keep the current status
+      console.log('⚠️ Unexpected scorecard count:', updatedScorecards.length);
+    }
+
+    await challengeRef.update(updateData);
+
+    res.json({
+      success: true,
+      message: 'Scorecard submitted successfully',
+      data: {
+        challengeId: id,
+        status: newStatus,
+        hasConflict,
+        scorecardData,
+        requiresProof: hasConflict
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Error submitting scorecard:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to submit scorecard',
+      error: error.message
+    });
+  }
+});
+
+// Check scorecard status
+router.get('/:id/scorecard-status', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const challengeRef = firestore.collection('challenges').doc(id);
+    const challengeDoc = await challengeRef.get();
+
+    if (!challengeDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        message: 'Challenge not found'
+      });
+    }
+
+    const challengeData = challengeDoc.data();
+    
+    // Check if user is part of this challenge
+    const isChallenger = challengeData.challenger.uid === req.user.uid;
+    const isOpponent = challengeData.opponents && challengeData.opponents.some(opp => 
+      opp.username === req.user.username
+    );
+
+    if (!isChallenger && !isOpponent) {
+      return res.status(403).json({
+        success: false,
+        message: 'You are not authorized to view this challenge'
+      });
+    }
+
+    const scorecards = challengeData.scorecards || [];
+    const hasExistingScorecard = scorecards.some(sc => sc.submittedBy === req.user.username);
+    
+    if (scorecards.length === 0) {
+      return res.json({
+        success: true,
+        hasExistingScorecard: false,
+        hasConflict: false,
+        requiresProof: false
+      });
+    }
+
+    if (scorecards.length === 1) {
+      return res.json({
+        success: true,
+        hasExistingScorecard,
+        hasConflict: false,
+        requiresProof: false,
+        waitingForSecondPlayer: true
+      });
+    }
+
+    // Check for conflicts
+    const hasConflict = scorecards.some((sc, index) => {
+      if (index === 0) return false;
+      const firstSc = scorecards[0];
+      return sc.playerAScore !== firstSc.playerAScore || sc.playerBScore !== firstSc.playerBScore;
+    });
+
+    return res.json({
+      success: true,
+      hasExistingScorecard,
+      hasConflict,
+      requiresProof: hasConflict,
+      playerAScorecard: scorecards[0],
+      playerBScorecard: scorecards[1]
+    });
+
+  } catch (error) {
+    console.error('❌ Error checking scorecard status:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to check scorecard status',
+      error: error.message
+    });
+  }
+});
+
+// Submit proof for scorecard conflict
+router.post('/:id/submit-proof', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { description } = req.body;
+    
+    console.log('🎯 Submitting proof for scorecard conflict:', id);
+
+    if (!description) {
+      return res.status(400).json({
+        success: false,
+        message: 'Proof description is required'
+      });
+    }
+
+    const challengeRef = firestore.collection('challenges').doc(id);
+    const challengeDoc = await challengeRef.get();
+
+    if (!challengeDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        message: 'Challenge not found'
+      });
+    }
+
+    const challengeData = challengeDoc.data();
+    
+    // Check if user is part of this challenge
+    const isChallenger = challengeData.challenger.uid === req.user.uid;
+    const isOpponent = challengeData.opponents && challengeData.opponents.some(opp => 
+      opp.username === req.user.username
+    );
+
+    if (!isChallenger && !isOpponent) {
+      return res.status(403).json({
+        success: false,
+        message: 'You are not authorized to submit proof for this challenge'
+      });
+    }
+
+    // Check if challenge is in conflict state
+    if (challengeData.status !== 'scorecard-conflict') {
+      return res.status(400).json({
+        success: false,
+        message: 'Challenge is not in conflict state'
+      });
+    }
+
+    // Handle file uploads if any
+    const proofImages = req.files ? req.files.map(file => file.path) : [];
+
+    // Update challenge with proof
+    await challengeRef.update({
+      proofImages,
+      proofDescription: description,
+      proofSubmittedAt: new Date(),
+      status: 'proof-submitted',
+      updatedAt: new Date()
+    });
+
+    // Process with AI verification
+    const aiResult = await performAIAnalysis(challengeData, proofImages, description, challengeData.challengerPlatformUsernames || {});
+    
+    // Update challenge with AI result
+    await challengeRef.update({
+      status: 'completed',
+      aiResult: aiResult,
+      winner: aiResult.winner,
+      completedAt: new Date(),
+      updatedAt: new Date()
+    });
+
+    // Process wallet transactions
+    const totalChallengeAmount = challengeData.stake * 2;
+    const rewardAmount = totalChallengeAmount * 0.95;
+    const adminFee = totalChallengeAmount * 0.05;
+    
+    // Find winner user ID
+    let winnerUserId = null;
+    if (aiResult.iWin) {
+      winnerUserId = req.user.uid;
+    } else {
+      // Find winner by username
+      const winner = aiResult.winner;
+      if (winner === challengeData.challenger.username) {
+        winnerUserId = challengeData.challenger.uid;
+      } else {
+        const winnerOpponent = challengeData.opponents.find(opp => opp.username === winner);
+        if (winnerOpponent) {
+          try {
+            const profile = await userService.getUserByUsername(winnerOpponent.username);
+            winnerUserId = profile.uid;
+          } catch (e) {
+            console.error('Error finding winner user:', e);
+          }
+        }
+      }
+    }
+    
+    if (winnerUserId) {
+      await walletService.awardReward(winnerUserId, rewardAmount, id, `Challenge reward for ${challengeData.game}`);
+      await walletService.addAdminFee(adminFee, id, `Admin fee from challenge ${challengeData.game}`);
+    }
+
+    res.json({
+      success: true,
+      message: 'Proof submitted and processed successfully',
+      data: {
+        challengeId: id,
+        status: 'completed',
+        aiResult,
+        winner: aiResult.winner,
+        isWinner: aiResult.iWin
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Error submitting proof:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to submit proof',
+      error: error.message
+    });
+  }
+});
+
+// Auto-forfeit for timeout
+router.post('/:id/auto-forfeit', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    console.log('🎯 Processing auto-forfeit for challenge:', id);
+
+    const challengeRef = firestore.collection('challenges').doc(id);
+    const challengeDoc = await challengeRef.get();
+
+    if (!challengeDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        message: 'Challenge not found'
+      });
+    }
+
+    const challengeData = challengeDoc.data();
+    
+    // Check if challenge is in scorecard-pending state
+    if (challengeData.status !== 'scorecard-pending') {
+      return res.status(400).json({
+        success: false,
+        message: 'Challenge is not in scorecard-pending state'
+      });
+    }
+
+    // Check if timer has expired (5 minutes)
+    const timerStarted = challengeData.scorecardTimerStarted;
+    if (!timerStarted) {
+      return res.status(400).json({
+        success: false,
+        message: 'No timer found for this challenge'
+      });
+    }
+
+    const timerExpiry = new Date(timerStarted.getTime() + 5 * 60 * 1000); // 5 minutes
+    const now = new Date();
+    
+    if (now < timerExpiry) {
+      return res.status(400).json({
+        success: false,
+        message: 'Timer has not expired yet'
+      });
+    }
+
+    // Find who submitted the first scorecard
+    const scorecards = challengeData.scorecards || [];
+    if (scorecards.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No scorecards found'
+      });
+    }
+
+    const firstScorecard = scorecards[0];
+    const winner = firstScorecard.submittedBy;
+    
+    // Update challenge status
+    await challengeRef.update({
+      status: 'completed',
+      winner: winner,
+      completedAt: new Date(),
+      autoForfeit: true,
+      updatedAt: new Date()
+    });
+
+    // Process wallet transactions
+    const totalChallengeAmount = challengeData.stake * 2;
+    const rewardAmount = totalChallengeAmount * 0.95;
+    const adminFee = totalChallengeAmount * 0.05;
+    
+    // Find winner user ID
+    let winnerUserId = null;
+    if (winner === challengeData.challenger.username) {
+      winnerUserId = challengeData.challenger.uid;
+    } else {
+      const winnerOpponent = challengeData.opponents.find(opp => opp.username === winner);
+      if (winnerOpponent) {
+        try {
+          const profile = await userService.getUserByUsername(winnerOpponent.username);
+          winnerUserId = profile.uid;
+        } catch (e) {
+          console.error('Error finding winner user:', e);
+        }
+      }
+    }
+    
+    if (winnerUserId) {
+      await walletService.awardReward(winnerUserId, rewardAmount, id, `Challenge reward for ${challengeData.game} (auto-forfeit)`);
+      await walletService.addAdminFee(adminFee, id, `Admin fee from challenge ${challengeData.game}`);
+    }
+
+    res.json({
+      success: true,
+      message: 'Auto-forfeit processed successfully',
+      data: {
+        challengeId: id,
+        status: 'completed',
+        winner: winner,
+        autoForfeit: true
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Error processing auto-forfeit:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to process auto-forfeit',
+      error: error.message
+    });
+  }
+});
+
+// AI verification endpoint for scorecard conflicts
+router.post('/:id/ai-verification', authenticateToken, multer({ 
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) cb(null, true);
+    else cb(new Error('Only image files are allowed'), false);
+  }
+}).array('proofImages', 5), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { description } = req.body;
+    const proofImages = req.files || [];
+    
+    console.log('🤖 Processing AI verification for challenge:', id);
+    console.log('🤖 Proof images count:', proofImages.length);
+    console.log('🤖 Description:', description);
+
+    if (!proofImages.length) {
+      return res.status(400).json({
+        success: false,
+        message: 'At least one proof image is required'
+      });
+    }
+
+    if (!description || !description.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Proof description is required'
+      });
+    }
+
+    const challengeRef = firestore.collection('challenges').doc(id);
+    const challengeDoc = await challengeRef.get();
+
+    if (!challengeDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        message: 'Challenge not found'
+      });
+    }
+
+    const challengeData = challengeDoc.data();
+
+    // Check if challenge is in scorecard-conflict or ai-verification-pending state
+    if (challengeData.status !== 'scorecard-conflict' && challengeData.status !== 'ai-verification-pending') {
+      return res.status(400).json({
+        success: false,
+        message: 'Challenge is not in scorecard-conflict or ai-verification-pending state'
+      });
+    }
+
+    // Check if user is part of this challenge
+    const isChallenger = challengeData.challenger.uid === req.user.uid;
+    const isOpponent = challengeData.opponents && challengeData.opponents.some(opp => 
+      opp.username === req.user.username
+    );
+
+    if (!isChallenger && !isOpponent) {
+      return res.status(403).json({
+        success: false,
+        message: 'You are not authorized to submit AI verification for this challenge'
+      });
+    }
+
+    // Get the current user's platform username for AI analysis
+    const currentUsername = req.user.username;
+    const challengePlatform = challengeData.platform?.toLowerCase() || '';
+    
+    let myTeam = '';
+    if (isChallenger) {
+      myTeam = challengeData.challengerPlatformUsernames?.[challengePlatform] || currentUsername;
+    } else {
+      const opponent = challengeData.opponents.find(opp => opp.username === currentUsername);
+      myTeam = opponent?.accepterPlatformUsernames?.[challengePlatform] || currentUsername;
+    }
+
+    // Prepare platform usernames for AI analysis
+    const platformUsernames = [];
+    if (challengeData.challengerPlatformUsernames?.[challengePlatform]) {
+      platformUsernames.push(challengeData.challengerPlatformUsernames[challengePlatform]);
+    }
+    if (challengeData.opponents) {
+      challengeData.opponents.forEach(opp => {
+        if (opp.accepterPlatformUsernames?.[challengePlatform]) {
+          platformUsernames.push(opp.accepterPlatformUsernames[challengePlatform]);
+        }
+      });
+    }
+
+    // Convert File objects to base64 data URLs for AI analysis
+    const proofImageUrls = proofImages.map(image => {
+      const base64 = Buffer.from(image.buffer).toString('base64');
+      return `data:${image.mimetype};base64,${base64}`;
+    });
+
+    // Call the existing AI analysis function
+    const aiResult = await performAIAnalysis(
+      challengeData,
+      proofImageUrls,
+      description,
+      platformUsernames
+    );
+
+    console.log('🤖 AI analysis result:', aiResult);
+
+    // Determine the winner based on AI analysis
+    const platformWinner = aiResult.winner;
+    
+    // Convert platform username back to login username
+    let actualWinner = platformWinner;
+    
+    console.log('🔍 Converting platform winner to login username:');
+    console.log('  - Platform winner:', platformWinner);
+    console.log('  - Challenge platform:', challengePlatform);
+    console.log('  - Challenger platform usernames:', challengeData.challengerPlatformUsernames);
+    console.log('  - Challenger username:', challengeData.challenger.username);
+    console.log('  - Opponents:', challengeData.opponents?.map(opp => ({
+      username: opp.username,
+      accepterPlatformUsernames: opp.accepterPlatformUsernames
+    })));
+    
+    // Debug: Check all possible platform usernames
+    const allPlatformUsernames = [];
+    if (challengeData.challengerPlatformUsernames?.[challengePlatform]) {
+      allPlatformUsernames.push({
+        type: 'challenger',
+        username: challengeData.challengerPlatformUsernames[challengePlatform],
+        loginUsername: challengeData.challenger.username
+      });
+    }
+    challengeData.opponents?.forEach(opp => {
+      if (opp.accepterPlatformUsernames?.[challengePlatform]) {
+        allPlatformUsernames.push({
+          type: 'opponent',
+          username: opp.accepterPlatformUsernames[challengePlatform],
+          loginUsername: opp.username
+        });
+      }
+    });
+    console.log('  - All platform usernames:', allPlatformUsernames);
+    
+    // Improved winner determination with better matching
+    let foundMatch = false;
+    
+    // 1. Exact match with challenger platform username
+    if (challengeData.challengerPlatformUsernames?.[challengePlatform] === platformWinner) {
+      actualWinner = challengeData.challenger.username;
+      foundMatch = true;
+      console.log('  - Exact match with challenger platform username:', actualWinner);
+    }
+    
+    // 2. Exact match with opponent platform usernames
+    if (!foundMatch) {
+      const winnerOpponent = challengeData.opponents.find(opp => 
+        opp.accepterPlatformUsernames?.[challengePlatform] === platformWinner
+      );
+      if (winnerOpponent) {
+        actualWinner = winnerOpponent.username;
+        foundMatch = true;
+        console.log('  - Exact match with opponent platform username:', actualWinner);
+      }
+    }
+    
+    // 3. Case-insensitive match with challenger platform username
+    if (!foundMatch) {
+      const challengerPlatformLower = challengeData.challengerPlatformUsernames?.[challengePlatform]?.toLowerCase();
+      if (challengerPlatformLower && platformWinner.toLowerCase() === challengerPlatformLower) {
+        actualWinner = challengeData.challenger.username;
+        foundMatch = true;
+        console.log('  - Case-insensitive match with challenger platform username:', actualWinner);
+      }
+    }
+    
+    // 4. Case-insensitive match with opponent platform usernames
+    if (!foundMatch) {
+      const winnerOpponentCaseInsensitive = challengeData.opponents.find(opp => {
+        const oppPlatformLower = opp.accepterPlatformUsernames?.[challengePlatform]?.toLowerCase();
+        return oppPlatformLower && platformWinner.toLowerCase() === oppPlatformLower;
+      });
+      if (winnerOpponentCaseInsensitive) {
+        actualWinner = winnerOpponentCaseInsensitive.username;
+        foundMatch = true;
+        console.log('  - Case-insensitive match with opponent platform username:', actualWinner);
+      }
+    }
+    
+    // 5. Partial match (contains) with challenger platform username
+    if (!foundMatch) {
+      const challengerPlatform = challengeData.challengerPlatformUsernames?.[challengePlatform];
+      if (challengerPlatform && (platformWinner.includes(challengerPlatform) || challengerPlatform.includes(platformWinner))) {
+        actualWinner = challengeData.challenger.username;
+        foundMatch = true;
+        console.log('  - Partial match with challenger platform username:', actualWinner);
+      }
+    }
+    
+    // 6. Partial match (contains) with opponent platform usernames
+    if (!foundMatch) {
+      const winnerOpponentPartial = challengeData.opponents.find(opp => {
+        const oppPlatform = opp.accepterPlatformUsernames?.[challengePlatform];
+        return oppPlatform && (platformWinner.includes(oppPlatform) || oppPlatform.includes(platformWinner));
+      });
+      if (winnerOpponentPartial) {
+        actualWinner = winnerOpponentPartial.username;
+        foundMatch = true;
+        console.log('  - Partial match with opponent platform username:', actualWinner);
+      }
+    }
+    
+    // 7. Fallback: use platform winner as-is (deterministic)
+    if (!foundMatch) {
+      actualWinner = platformWinner;
+      console.log('  - No match found, using platform winner as-is:', actualWinner);
+      console.log('  - This ensures consistent results for both users');
+    }
+    
+    console.log('🏆 Final winner determination:', actualWinner);
+    
+    // Clean aiResult to remove undefined values for Firestore
+    const cleanAiResult = {};
+    Object.keys(aiResult).forEach(key => {
+      if (aiResult[key] !== undefined && aiResult[key] !== null) {
+        cleanAiResult[key] = aiResult[key];
+      }
+    });
+    
+    // Ensure challengeId is set
+    cleanAiResult.challengeId = id;
+    
+    console.log('🤖 Cleaned AI result for Firestore:', cleanAiResult);
+    
+    // Check if there are existing AI verification results
+    const existingAiResults = challengeData.aiVerificationResults || [];
+    const hasExistingAiResult = existingAiResults.length > 0;
+    const isFirstAiVerification = !hasExistingAiResult;
+    
+    // Check if current user has already submitted AI verification
+    const userHasAlreadySubmitted = existingAiResults.some(result => 
+      result.submittedBy === req.user.username
+    );
+    
+    if (userHasAlreadySubmitted) {
+      return res.status(400).json({
+        success: false,
+        message: 'You have already submitted AI verification for this challenge'
+      });
+    }
+    
+    // Add current AI result
+    const newAiResult = {
+      ...cleanAiResult,
+      submittedBy: req.user.username,
+      submittedAt: new Date(),
+      winner: actualWinner
+    };
+    
+    const updatedAiResults = [...existingAiResults, newAiResult];
+    
+    // Check for AI verification conflicts
+    let hasAiConflict = false;
+    let newStatus = 'ai-verification-pending';
+    
+    if (hasExistingAiResult) {
+      const firstResult = existingAiResults[0];
+      
+      // Debug logging for conflict detection
+      console.log('🔍 AI Conflict Detection Debug:', {
+        firstResult: {
+          winner: firstResult.winner,
+          type: typeof firstResult.winner,
+          submittedBy: firstResult.submittedBy
+        },
+        currentResult: {
+          winner: actualWinner,
+          type: typeof actualWinner,
+          submittedBy: req.user.username
+        },
+        strictEqual: firstResult.winner === actualWinner,
+        looseEqual: firstResult.winner == actualWinner
+      });
+      
+      // Normalize both winners for comparison (trim whitespace, convert to lowercase)
+      const normalizedFirstWinner = String(firstResult.winner || '').trim().toLowerCase();
+      const normalizedCurrentWinner = String(actualWinner || '').trim().toLowerCase();
+      
+      console.log('🔍 Normalized comparison:', {
+        firstWinner: normalizedFirstWinner,
+        currentWinner: normalizedCurrentWinner,
+        areEqual: normalizedFirstWinner === normalizedCurrentWinner
+      });
+      
+      if (normalizedFirstWinner !== normalizedCurrentWinner) {
+        hasAiConflict = true;
+        newStatus = 'ai-conflict';
+        console.log('⚠️ AI verification conflict detected:', {
+          firstWinner: firstResult.winner,
+          secondWinner: actualWinner,
+          firstSubmittedBy: firstResult.submittedBy,
+          secondSubmittedBy: req.user.username,
+          normalizedFirst: normalizedFirstWinner,
+          normalizedSecond: normalizedCurrentWinner
+        });
+      } else {
+        // Both AI results agree, proceed to completion
+        newStatus = 'completed';
+        console.log('✅ Both AI verifications agree, proceeding to completion');
+      }
+    }
+    
+    // Update challenge status
+    const updateData = {
+      aiVerificationResults: updatedAiResults,
+      updatedAt: new Date()
+    };
+    
+    // If this is the first AI verification, start the timer
+    if (isFirstAiVerification) {
+      const timerEndTime = Date.now() + (5 * 60 * 1000); // 5 minutes from now as timestamp
+      updateData.aiVerificationTimerEnd = timerEndTime;
+      updateData.status = 'ai-verification-pending';
+      console.log('⏰ First AI verification submitted, starting 5-minute timer until:', new Date(timerEndTime));
+    }
+    
+    // Automatic correction for "Unknown" winners
+    let correctedWinner = actualWinner;
+    if (actualWinner === 'Unknown' && cleanAiResult.scoreCorrected) {
+      // If AI analysis corrected the winner based on scores, use that
+      correctedWinner = cleanAiResult.winner;
+      console.log('🔧 Auto-correcting Unknown winner to:', correctedWinner);
+    } else if (actualWinner === 'Unknown' && cleanAiResult.players && cleanAiResult.players.length > 0) {
+      // If winner is still Unknown but we have score data, determine winner from scores
+      const playerScores = {};
+      cleanAiResult.players.forEach(player => {
+        const [name, score] = player.split(':');
+        if (name && score) {
+          playerScores[name.trim()] = parseInt(score.trim());
+        }
+      });
+      
+      if (Object.keys(playerScores).length === 2) {
+        const scores = Object.values(playerScores);
+        const names = Object.keys(playerScores);
+        const maxScore = Math.max(...scores);
+        const winnerIndex = scores.indexOf(maxScore);
+        correctedWinner = names[winnerIndex];
+        console.log('🔧 Auto-correcting Unknown winner from scores:', correctedWinner);
+      }
+    }
+
+    if (hasAiConflict) {
+      updateData.status = 'ai-conflict';
+      updateData.aiConflictDetectedAt = new Date();
+      updateData.disputeStatus = 'pending';
+    } else if (newStatus === 'completed') {
+      updateData.status = 'completed';
+      updateData.winner = correctedWinner;
+      updateData.completedAt = new Date();
+      updateData.aiVerification = true;
+      updateData.aiVerificationResult = cleanAiResult;
+    }
+    
+    updateData.proofDescription = description;
+    updateData.proofImages = proofImages.map(img => ({
+      originalName: img.originalname,
+      size: img.size,
+      mimetype: img.mimetype,
+      uploadedAt: new Date()
+    }));
+    
+    await challengeRef.update(updateData);
+
+    // Process wallet transactions only if both AI verifications are complete and no conflict
+    if (newStatus === 'completed' && !hasAiConflict) {
+      const totalChallengeAmount = challengeData.stake * 2;
+      const rewardAmount = totalChallengeAmount * 0.95;
+      const adminFee = totalChallengeAmount * 0.05;
+      
+      // Find winner user ID using the mapped login username
+      let winnerUserId = null;
+      if (actualWinner === challengeData.challenger.username) {
+        winnerUserId = challengeData.challenger.uid;
+        console.log('  - Winner user ID (challenger):', winnerUserId);
+      } else {
+        // Find in opponents
+        const winnerOpponent = challengeData.opponents.find(opp => 
+          opp.username === actualWinner
+        );
+        if (winnerOpponent) {
+          try {
+            const profile = await userService.getUserByUsername(winnerOpponent.username);
+            winnerUserId = profile.uid;
+            console.log('  - Winner user ID (opponent):', winnerUserId);
+          } catch (e) {
+            console.error('Error finding winner user:', e);
+          }
+        }
+      }
+      
+      if (winnerUserId) {
+        await walletService.awardReward(winnerUserId, rewardAmount, id, `Challenge reward for ${challengeData.game} (AI Verified)`);
+        await walletService.addAdminFee(adminFee, id, `Admin fee from challenge ${challengeData.game} (AI Verified)`);
+      }
+    } else {
+      console.log('⚠️ AI conflict detected, holding credits until admin resolution');
+    }
+
+    console.log('✅ AI verification completed. Winner:', actualWinner);
+
+    res.json({
+      success: true,
+      message: hasAiConflict ? 'AI verification submitted, conflict detected - sent to admin for review' : 'AI verification completed successfully',
+      winner: actualWinner, // Return the mapped login username
+      aiVerification: true,
+      aiResult: cleanAiResult,
+      hasConflict: hasAiConflict,
+      status: newStatus
+    });
+
+  } catch (error) {
+    console.error('❌ Error processing AI verification:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to process AI verification',
+      error: error.message
+    });
+  }
+});
+
+// Admin route to resolve AI conflicts
+router.post('/:id/resolve-ai-conflict', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { winner, adminReason } = req.body;
+    
+    console.log('🔧 Admin resolving AI conflict for challenge:', id, 'Winner:', winner);
+    
+    // Check if user is admin (you can implement proper admin check)
+    if (req.user.username !== 'admin') {
+      return res.status(403).json({
+        success: false,
+        message: 'Only admins can resolve AI conflicts'
+      });
+    }
+    
+    const challengeRef = firestore.collection('challenges').doc(id);
+    const challengeDoc = await challengeRef.get();
+    
+    if (!challengeDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        message: 'Challenge not found'
+      });
+    }
+    
+    const challengeData = challengeDoc.data();
+    
+    if (challengeData.status !== 'ai-conflict') {
+      return res.status(400).json({
+        success: false,
+        message: 'Challenge is not in AI conflict state'
+      });
+    }
+    
+    // Process wallet transactions
+    const totalChallengeAmount = challengeData.stake * 2;
+    const rewardAmount = totalChallengeAmount * 0.95;
+    const adminFee = totalChallengeAmount * 0.05;
+    
+    // Find winner user ID
+    let winnerUserId = null;
+    if (winner === challengeData.challenger.username) {
+      winnerUserId = challengeData.challenger.uid;
+    } else {
+      const winnerOpponent = challengeData.opponents.find(opp => opp.username === winner);
+      if (winnerOpponent) {
+        try {
+          const profile = await userService.getUserByUsername(winnerOpponent.username);
+          winnerUserId = profile.uid;
+        } catch (e) {
+          console.error('Error finding winner user:', e);
+        }
+      }
+    }
+    
+    if (winnerUserId) {
+      await walletService.awardReward(winnerUserId, rewardAmount, id, `Challenge reward for ${challengeData.game} (Admin Resolved)`);
+      await walletService.addAdminFee(adminFee, id, `Admin fee from challenge ${challengeData.game} (Admin Resolved)`);
+    }
+    
+    // Update challenge status
+    await challengeRef.update({
+      status: 'completed',
+      winner: winner,
+      completedAt: new Date(),
+      disputeStatus: 'resolved',
+      adminResolution: {
+        resolvedBy: req.user.username,
+        resolvedAt: new Date(),
+        reason: adminReason || 'Admin resolution of AI conflict'
+      },
+      updatedAt: new Date()
+    });
+    
+    console.log('✅ AI conflict resolved by admin. Winner:', winner);
+    
+    res.json({
+      success: true,
+      message: 'AI conflict resolved successfully',
+      winner: winner
+    });
+    
+  } catch (error) {
+    console.error('❌ Error resolving AI conflict:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to resolve AI conflict',
+      error: error.message
+    });
+  }
+});
+
+// Root endpoint for challenges
+router.get('/', (req, res) => {
+  res.json({
+    success: true,
+    message: 'Challenges API is working',
+    availableEndpoints: [
+      'GET /test - Test endpoint',
+      'GET /my-challenges - Get user\'s challenges',
+      'GET /for-me - Get challenges for user as opponent',
+      'GET /public - Get public challenges',
+      'GET /:id - Get specific challenge',
+      'POST / - Create new challenge'
+    ],
+    timestamp: new Date().toISOString()
+  });
 });
 
 module.exports = router;

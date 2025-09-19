@@ -22,15 +22,31 @@ const upload = multer({
 
 // Utility: determine actual winner from score + players
 function getWinnerFromScore(score, players) {
+  console.log('🔍 getWinnerFromScore called with:', { score, players });
+  
   const scoreMatch = score?.match(/(\d+)[-:](\d+)/);
-  if (!scoreMatch || !players || players.length < 2) return null;
+  console.log('🔍 Score match result:', scoreMatch);
+  
+  if (!scoreMatch || !players || players.length < 2) {
+    console.log('🔍 Invalid input, returning null');
+    return null;
+  }
 
   const score1 = parseInt(scoreMatch[1]);
   const score2 = parseInt(scoreMatch[2]);
   const [p1, p2] = players.map(p => p.split(':')[0].trim());
+  
+  console.log('🔍 Parsed values:', { score1, score2, p1, p2 });
 
-  if (score1 > score2) return p1;
-  if (score2 > score1) return p2;
+  if (score1 > score2) {
+    console.log('🔍 Score1 > Score2, returning p1:', p1);
+    return p1;
+  }
+  if (score2 > score1) {
+    console.log('🔍 Score2 > Score1, returning p2:', p2);
+    return p2;
+  }
+  console.log('🔍 Tie or invalid, returning null');
   return null; // tie or invalid
 }
 
@@ -169,7 +185,11 @@ router.post('/verify-challenge-proof', authenticateToken, upload.single('screens
     const result = JSON.parse(response.choices[0].message.content);
 
     // ✅ Score-based correction
+    console.log('🔍 AI Analysis Result:', result);
     const scoreWinner = getWinnerFromScore(result.score, result.players);
+    console.log('🔍 Score-based winner:', scoreWinner);
+    console.log('🔍 AI reported winner:', result.winner);
+    
     let correctedWinner = result.winner;
     let contradictionDetected = false;
 
@@ -180,6 +200,12 @@ router.post('/verify-challenge-proof', authenticateToken, upload.single('screens
       result.correctedWinner = scoreWinner;
       result.winner = scoreWinner;
       console.log(`⚠️ AI contradiction fixed: winner corrected to ${scoreWinner}`);
+    } else if (scoreWinner && !result.winner) {
+      // If AI didn't determine a winner but we can from score, use score-based winner
+      result.winner = scoreWinner;
+      console.log(`✅ Using score-based winner: ${scoreWinner}`);
+    } else if (!scoreWinner) {
+      console.log('⚠️ Could not determine winner from score');
     }
 
     const iWin = didIWin(myTeam, result.winner);

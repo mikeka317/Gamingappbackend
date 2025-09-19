@@ -5,7 +5,8 @@ const multer = require('multer');
 const { WalletService } = require('../services/walletService');
 const { DisputeService } = require('../services/disputeService');
 const { PayPalService } = require('../services/paypalService');
-const { storage } = require('../config/firebase');
+const BusinessWalletService = require('../services/businessWalletService');
+const { storage, firestore } = require('../config/firebase');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const router = express.Router();
@@ -380,7 +381,12 @@ router.get('/disputes/:id', authenticateToken, async (req, res) => {
 // Withdrawal endpoint - handles multi-gateway wallet scenario
 router.post('/withdraw', authenticateToken, async (req, res) => {
   try {
-    const { amount, description, preferredPayoutMethod, payoutEmail, bankAccountId } = req.body;
+    const { amount, description, preferredPayoutMethod, method, payoutEmail, paypalEmail, bankAccountId, currency: bodyCurrency } = req.body;
+    
+    // Use method or preferredPayoutMethod (frontend compatibility)
+    const payoutMethod = preferredPayoutMethod || method;
+    const emailForPayout = payoutEmail || paypalEmail;
+    const currency = (bodyCurrency || 'CAD').toUpperCase();
     
     if (!amount || amount <= 0) {
       return res.status(400).json({
@@ -401,97 +407,132 @@ router.post('/withdraw', authenticateToken, async (req, res) => {
     // Process withdrawal using the preferred payout method
     let withdrawalResult;
     
-    if (preferredPayoutMethod === 'paypal') {
-      // PayPal payout with multi-source platform balance logic (PayPal + Stripe)
-      if (!payoutEmail) {
+    if (payoutMethod === 'paypal') {
+      // Direct PayPal payout - no Firebase, no complex balance checking
+      if (!emailForPayout) {
         return res.status(400).json({
           success: false,
           message: 'PayPal email is required for PayPal payouts'
         });
       }
 
+      console.log('🔄 Processing direct PayPal withdrawal...', {
+        amount,
+        emailForPayout,
+        description: description || 'Withdrawal from Cyber Duel Grid'
+      });
+
       const paypalService = new PayPalService();
-      let paypalAvailable = 0;
-      let stripeAvailable = 0;
-      const sourceBreakdown = { paypal: 0, stripe: 0 };
-
-      // Attempt to get PayPal available balance (USD)
-      try {
-        const bal = await paypalService.getBalances(false);
-        const balances = bal?.data?.balances;
-        if (Array.isArray(balances)) {
-          const usd = balances.find(b => (b.currency || b.currency_code) === 'USD');
-          const availableField = usd?.available_balance || {};
-          const val = typeof availableField === 'object'
-            ? (availableField.value || availableField.amount)
-            : availableField;
-          paypalAvailable = val ? parseFloat(val) : 0;
-        } else if (typeof bal?.data?.computedBalance === 'number') {
-          // Fallback computed value (not real available); best-effort only
-          paypalAvailable = Math.max(0, parseFloat(String(bal.data.computedBalance)) || 0);
-        }
-      } catch (e) {
-        // If unauthorized or any error, treat as 0
-        paypalAvailable = 0;
-      }
-
-      // Get Stripe platform available balance (USD)
-      try {
-        const stripeBal = await stripe.balance.retrieve();
-        const avail = Array.isArray(stripeBal?.available) ? stripeBal.available : [];
-        stripeAvailable = avail
-          .filter(e => (e.currency || '').toLowerCase() === 'usd')
-          .reduce((sum, e) => sum + (typeof e.amount === 'number' ? e.amount : 0), 0) / 100; // cents -> USD
-      } catch (e) {
-        stripeAvailable = 0;
-      }
-
-      // Decide how to fund this payout from platform balances
-      if (amount <= paypalAvailable) {
-        sourceBreakdown.paypal = amount;
-      } else if (amount <= paypalAvailable + stripeAvailable) {
-        sourceBreakdown.paypal = Math.max(0, paypalAvailable);
-        sourceBreakdown.stripe = amount - sourceBreakdown.paypal;
-      } else {
-        return res.status(400).json({
-          success: false,
-          message: 'Withdrawal not possible: insufficient platform funds',
-          data: {
-            requested: amount,
-            paypalAvailable,
-            stripeAvailable,
-            combinedAvailable: Number((paypalAvailable + stripeAvailable).toFixed(2))
-          }
-        });
-      }
-
-      // Perform the payout to the user's PayPal account for the full requested amount
+      
+      // Process PayPal payout directly
       const payoutResult = await paypalService.processPayout(
         amount,
-        payoutEmail,
-        description || 'Withdrawal from Cyber Duel Grid'
+        emailForPayout,
+        description || 'Withdrawal from Cyber Duel Grid',
+        currency
       );
+      
+      console.log('📊 PayPal payout result:', payoutResult);
+
+      // Check payout status after a short delay
+      if (payoutResult.success && payoutResult.payoutId) {
+        console.log('⏳ Waiting 2 seconds before checking payout status...');
+        setTimeout(async () => {
+          try {
+            const statusResult = await paypalService.getPayoutStatus(payoutResult.payoutId);
+            console.log('📊 PayPal payout status check:', statusResult);
+          } catch (error) {
+            console.error('❌ Error checking payout status:', error);
+          }
+        }, 2000);
+      }
 
       if (payoutResult.success) {
-        withdrawalResult = await walletService.processWithdrawal(
-          req.user.uid,
-          amount,
-          description || 'PayPal withdrawal',
-          'paypal'
-        );
-        withdrawalResult.paypalPayoutId = payoutResult.payoutId;
-        withdrawalResult.paypalStatus = payoutResult.status;
-        withdrawalResult.sourceBreakdown = sourceBreakdown;
-        withdrawalResult.platformBalances = { paypalAvailable, stripeAvailable };
+        // Deduct from user's wallet (using wallet service for this part only)
+        const userRef = firestore.collection('users').doc(req.user.uid);
+        const userDoc = await userRef.get();
+        
+        if (!userDoc.exists) {
+          return res.status(404).json({
+            success: false,
+            message: 'User not found'
+          });
+        }
+        
+        const userData = userDoc.data();
+        const currentBalance = userData.wallet || 0;
+        
+        if (currentBalance < amount) {
+          return res.status(400).json({
+            success: false,
+            message: 'Insufficient funds in user wallet'
+          });
+        }
+        
+        const newBalance = currentBalance - amount;
+        
+        // Update user wallet balance
+        await userRef.update({
+          wallet: newBalance,
+          updatedAt: new Date()
+        });
+        
+        // Create withdrawal transaction record
+        const transaction = {
+          walletId: req.user.uid,
+          userId: req.user.uid,
+          username: userData.username,
+          type: 'withdrawal',
+          amount: -amount, // Negative amount for withdrawal
+          description: description || 'PayPal withdrawal',
+          status: 'completed', // PayPal payout was successful
+          reference: `withdrawal_${Date.now()}`,
+          metadata: { 
+            payoutMethod: 'paypal',
+            withdrawalId: `wd_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+            paypalPayoutId: payoutResult.payoutId,
+            paypalStatus: payoutResult.status
+          },
+          createdAt: new Date(),
+          updatedAt: new Date()
+        };
+        
+        // Store transaction in separate transactions collection
+        const transactionRef = await firestore.collection('transactions').add(transaction);
+        const transactionId = transactionRef.id;
+        
+        withdrawalResult = {
+          ...transaction,
+          id: transactionId,
+          newBalance,
+          previousBalance: currentBalance,
+          payoutResult: {
+            success: true,
+            payoutId: payoutResult.payoutId,
+            amount: amount,
+            method: 'paypal',
+            status: payoutResult.status,
+            message: `Successfully processed PayPal payout of ${currency} ${amount}`
+          }
+        };
+        
+        console.log('✅ Direct PayPal withdrawal completed successfully:', {
+          payoutId: payoutResult.payoutId,
+          amount: amount,
+          email: emailForPayout,
+          newBalance: newBalance
+        });
       } else {
+        console.error('❌ PayPal payout failed:', payoutResult.error);
         return res.status(500).json({
           success: false,
           message: 'PayPal payout failed',
-          error: payoutResult.error
+          error: payoutResult.error,
+          details: 'The withdrawal could not be processed. Please try again or contact support.'
         });
       }
       
-    } else if (preferredPayoutMethod === 'stripe') {
+    } else if (payoutMethod === 'stripe') {
       // Stripe withdrawal - call Stripe withdrawal endpoint directly
       try {
         const stripeResponse = await fetch(`${process.env.BACKEND_URL || 'http://localhost:5072'}/api/stripe/withdraw`, {
@@ -532,13 +573,11 @@ router.post('/withdraw', authenticateToken, async (req, res) => {
       }
       
     } else {
-      // Default withdrawal processing
-      withdrawalResult = await walletService.processWithdrawal(
-        req.user.uid,
-        amount,
-        description || 'Withdrawal',
-        preferredPayoutMethod || 'manual'
-      );
+      // Unsupported withdrawal method
+      return res.status(400).json({
+        success: false,
+        message: `Unsupported withdrawal method: ${payoutMethod}. Supported methods: paypal, stripe`
+      });
     }
     
     res.json({
@@ -657,6 +696,21 @@ router.post('/paypal/verify-payment', authenticateToken, async (req, res) => {
       };
     }
     
+    // Record business wallet deposit
+    const businessWalletService = new BusinessWalletService();
+    const businessDeposit = await businessWalletService.recordDeposit(
+      amount,
+      'USD', // PayPal deposits are typically in USD
+      orderId,
+      req.user.email || 'unknown',
+      captured ? 'PayPal deposit completed' : 'PayPal deposit verified'
+    );
+
+    if (!businessDeposit.success) {
+      console.error('❌ Failed to record business deposit:', businessDeposit.error);
+      // Continue with user deposit even if business tracking fails
+    }
+
     // Credit user's wallet
     const transaction = await walletService.addFunds(
       req.user.uid,
@@ -665,13 +719,20 @@ router.post('/paypal/verify-payment', authenticateToken, async (req, res) => {
       captureMeta
     );
     
+    console.log('✅ Deposit completed successfully:', {
+      userDeposit: transaction,
+      businessDeposit: businessDeposit,
+      amount: amount
+    });
+    
     return res.json({
       success: true,
       message: captured ? 'Payment captured and funds added to wallet' : 'Payment verified and funds added to wallet',
       data: {
         transaction,
         amount,
-        status: captureMeta.paypalStatus || 'COMPLETED'
+        status: captureMeta.paypalStatus || 'COMPLETED',
+        businessTransactionId: businessDeposit.transactionId
       }
     });
   } catch (error) {
@@ -728,10 +789,103 @@ router.get('/paypal/balance', authenticateToken, async (req, res) => {
     if (result.success) {
       return res.json({ success: true, data: result.data });
     }
-    return res.status(500).json({ success: false, message: 'Failed to fetch PayPal balance', error: result.error });
+    
+    // Provide more specific error message for PayPal API issues
+    const errorMessage = result.error?.includes('NOT_AUTHORIZED') 
+      ? 'PayPal API permissions not configured. Please check PayPal app settings.'
+      : 'Failed to fetch PayPal balance';
+      
+    return res.status(500).json({ 
+      success: false, 
+      message: errorMessage, 
+      error: result.error,
+      requiresPayPalSetup: true
+    });
   } catch (error) {
     console.error('Error fetching PayPal balance:', error);
     res.status(500).json({ success: false, message: 'Failed to fetch PayPal balance', error: error.message });
+  }
+});
+
+// Set initial business balance (admin only)
+router.post('/business-balance/set-initial', authenticateToken, async (req, res) => {
+  try {
+    const isProd = process.env.NODE_ENV === 'production';
+    if (isProd && !(req.user && req.user.isAdmin)) {
+      return res.status(403).json({ success: false, message: 'Access denied. Admin privileges required.' });
+    }
+    
+    const { amount, currency = 'CAD', description } = req.body;
+    
+    if (!amount || amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Valid amount is required'
+      });
+    }
+    
+    const businessWalletService = new BusinessWalletService();
+    const result = await businessWalletService.setInitialBalance(amount, currency, description);
+    
+    if (result.success) {
+      return res.json({
+        success: true,
+        message: 'Initial business balance set successfully',
+        data: {
+          transactionId: result.transactionId,
+          amount,
+          currency
+        }
+      });
+    } else {
+      return res.status(400).json({
+        success: false,
+        message: result.message || 'Failed to set initial balance',
+        error: result.error
+      });
+    }
+  } catch (error) {
+    console.error('Error setting initial business balance:', error);
+    res.status(500).json({ success: false, message: 'Failed to set initial balance', error: error.message });
+  }
+});
+
+// Get business wallet balance (real-time)
+router.get('/business-balance', authenticateToken, async (req, res) => {
+  try {
+    const isProd = process.env.NODE_ENV === 'production';
+    if (isProd && !(req.user && req.user.isAdmin)) {
+      return res.status(403).json({ success: false, message: 'Access denied. Admin privileges required.' });
+    }
+    
+    // Fetch directly from PayPal business account
+    const paypalService = new PayPalService();
+    const balanceResult = await paypalService.getBalances(true); // fullRange = true for complete data
+    
+    if (balanceResult.success) {
+      const balanceData = balanceResult.data;
+      return res.json({ 
+        success: true, 
+        data: {
+          balance: balanceData.computedBalance || 0,
+          currency: balanceData.currency || 'CAD',
+          allCurrencies: balanceData.allCurrencies || {},
+          transactionCount: balanceData.transactionCount || 0,
+          lastUpdated: new Date().toISOString(),
+          source: 'paypal_direct'
+        }
+      });
+    } else {
+      return res.status(500).json({ 
+        success: false, 
+        message: 'Failed to fetch PayPal business balance', 
+        error: balanceResult.error,
+        requiresPayPalSetup: balanceResult.error?.includes('NOT_AUTHORIZED')
+      });
+    }
+  } catch (error) {
+    console.error('Error getting PayPal business balance:', error);
+    res.status(500).json({ success: false, message: 'Failed to get PayPal business balance', error: error.message });
   }
 });
 
