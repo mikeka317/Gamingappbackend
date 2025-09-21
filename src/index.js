@@ -23,7 +23,7 @@ const stripeRoutes = require('./routes/stripe');
 
 
 const app = express();
-const PORT = process.env.PORT || 5402;
+const PORT = process.env.PORT || 5072;
 
 // Security middleware
 // app.use(helmet()); // Temporarily disabled for CORS debugging

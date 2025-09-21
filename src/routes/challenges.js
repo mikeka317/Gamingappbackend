@@ -833,6 +833,42 @@ router.get('/test', (req, res) => {
   });
 });
 
+// Debug endpoint to test Firestore connection
+router.get('/debug-firestore', authenticateToken, async (req, res) => {
+  try {
+    console.log('🔍 Testing Firestore connection...');
+    
+    const challengesRef = firestore.collection('challenges');
+    const snapshot = await challengesRef.limit(5).get();
+    
+    const challenges = [];
+    snapshot.forEach(doc => {
+      challenges.push({
+        id: doc.id,
+        challenger: doc.data().challenger?.username,
+        status: doc.data().status,
+        createdAt: doc.data().createdAt
+      });
+    });
+    
+    res.json({
+      success: true,
+      message: 'Firestore connection working',
+      data: {
+        totalChallenges: challenges.length,
+        sampleChallenges: challenges
+      }
+    });
+  } catch (error) {
+    console.error('❌ Firestore debug error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Firestore connection failed',
+      error: error.message
+    });
+  }
+});
+
 // Helper function to serialize Firestore documents
 const serializeFirestoreDoc = (doc) => {
   const data = doc.data();
@@ -1047,29 +1083,52 @@ router.get('/my-challenges', authenticateToken, async (req, res) => {
     console.log('🎯 Fetching challenges for user:', req.user.uid);
     
     const challengesRef = firestore.collection('challenges');
-    
-    // Get challenges where user is challenger (challenges they created)
-    const challengerSnap = await challengesRef
-      .where('challenger.uid', '==', req.user.uid)
-      .get();
+    let challenges = [];
 
-    const challenges = [];
+    try {
+      // OPTIMIZATION: Add ordering and limit for better performance
+      const challengerSnap = await challengesRef
+        .where('challenger.uid', '==', req.user.uid)
+        .orderBy('createdAt', 'desc')
+        .limit(50) // Limit results for better performance
+        .get();
 
-    // Process challenger challenges (challenges created by user)
-    challengerSnap.forEach(doc => {
-      const serialized = serializeFirestoreDoc(doc);
-      serialized.type = 'outgoing'; // Mark as outgoing (created by user)
-      challenges.push(serialized);
-    });
+      // Process challenger challenges (challenges created by user)
+      challengerSnap.forEach(doc => {
+        const serialized = serializeFirestoreDoc(doc);
+        serialized.type = 'outgoing'; // Mark as outgoing (created by user)
+        challenges.push(serialized);
+      });
 
-    // Sort by creation date (newest first)
-    challenges.sort((a, b) => {
-      const dateA = new Date(a.createdAt);
-      const dateB = new Date(b.createdAt);
-      return dateB - dateA;
-    });
+      console.log(`✅ Found ${challenges.length} challenges created by user using optimized query`);
 
-    console.log(`✅ Found ${challenges.length} challenges created by user`);
+    } catch (indexError) {
+      console.warn('⚠️ Optimized query failed, falling back to legacy method:', indexError.message);
+      
+      // Fallback: Get all challenges and filter in memory
+      const snapshot = await challengesRef.get();
+      
+      snapshot.forEach(doc => {
+        const data = doc.data();
+        if (data.challenger && data.challenger.uid === req.user.uid) {
+          const serialized = serializeFirestoreDoc(doc);
+          serialized.type = 'outgoing';
+          challenges.push(serialized);
+        }
+      });
+
+      // Sort by createdAt descending
+      challenges.sort((a, b) => {
+        const dateA = new Date(a.createdAt);
+        const dateB = new Date(b.createdAt);
+        return dateB - dateA;
+      });
+
+      // Limit to 50 results
+      challenges = challenges.slice(0, 50);
+
+      console.log(`✅ Found ${challenges.length} challenges created by user using fallback method`);
+    }
 
     res.json({
       success: true,
@@ -1139,48 +1198,60 @@ router.get('/for-me', authenticateToken, async (req, res) => {
     autoFixUnknownWinners().catch(console.error);
     
     console.log('🎯 Fetching challenges for user (as opponent):', req.user.uid);
-    console.log('🎯 Looking for username:', req.user.username);
     
     const challengesRef = firestore.collection('challenges');
-    
-    // Get all challenges and filter in memory since Firestore array-contains with objects is tricky
-    const snapshot = await challengesRef.get();
+    let challenges = [];
 
-    const challenges = [];
-    snapshot.forEach(doc => {
-      const data = doc.data();
-      
-      // Check if current user is in the opponents array
-      const isOpponent = data.opponents && data.opponents.some(opp => 
-        opp.username === req.user.username
-      );
-      
-      console.log(`🔍 Challenge ${doc.id}: checking if ${req.user.username} is opponent`);
-      console.log(`🔍 Opponents:`, data.opponents);
-      console.log(`🔍 Is opponent:`, isOpponent);
-      
-              if (isOpponent) {
+    try {
+      // OPTIMIZATION: Use compound query with array-contains for better performance
+      // This requires a Firestore index on 'opponents.username' field
+      const snapshot = await challengesRef
+        .where('opponents', 'array-contains', { username: req.user.username })
+        .orderBy('createdAt', 'desc')
+        .limit(50) // Limit results for better performance
+        .get();
+
+      snapshot.forEach(doc => {
         const serialized = serializeFirestoreDoc(doc);
         serialized.type = 'incoming';
         challenges.push(serialized);
-      }
-    });
+      });
 
-    // Sort by creation date (newest first)
-    challenges.sort((a, b) => {
-      const dateA = new Date(a.createdAt);
-      const dateB = new Date(b.createdAt);
-      return dateB - dateA;
-    });
+      console.log(`✅ Found ${challenges.length} challenges for user (as opponent) using optimized query`);
 
-    console.log(`✅ Found ${challenges.length} challenges for user (as opponent)`);
-    console.log(`✅ Challenges:`, challenges.map(c => ({ 
-      id: c.id, 
-      challenger: c.challenger.username, 
-      opponents: c.opponents.map(o => o.username),
-      myTeam: c.myTeam,
-      hasMyTeam: 'myTeam' in c
-    })));
+    } catch (indexError) {
+      console.warn('⚠️ Optimized query failed, falling back to legacy method:', indexError.message);
+      
+      // FALLBACK: Use the old method if the index doesn't exist yet
+      const snapshot = await challengesRef.get();
+      
+      snapshot.forEach(doc => {
+        const data = doc.data();
+        
+        // Check if current user is in the opponents array
+        const isOpponent = data.opponents && data.opponents.some(opp => 
+          opp.username === req.user.username
+        );
+        
+        if (isOpponent) {
+          const serialized = serializeFirestoreDoc(doc);
+          serialized.type = 'incoming';
+          challenges.push(serialized);
+        }
+      });
+
+      // Sort by creation date (newest first)
+      challenges.sort((a, b) => {
+        const dateA = new Date(a.createdAt);
+        const dateB = new Date(b.createdAt);
+        return dateB - dateA;
+      });
+
+      // Limit results for performance
+      challenges = challenges.slice(0, 50);
+
+      console.log(`✅ Found ${challenges.length} challenges for user (as opponent) using fallback method`);
+    }
 
     res.json({
       success: true,
@@ -1192,6 +1263,71 @@ router.get('/for-me', authenticateToken, async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Failed to fetch challenges for user',
+      error: error.message
+    });
+  }
+});
+
+// Get dispute status for multiple challenges (bulk check)
+router.post('/bulk-dispute-check', authenticateToken, async (req, res) => {
+  try {
+    const { challengeIds } = req.body;
+    
+    if (!Array.isArray(challengeIds)) {
+      return res.status(400).json({
+        success: false,
+        message: 'challengeIds must be an array'
+      });
+    }
+
+    console.log('🎯 Bulk checking disputes for challenges:', challengeIds);
+
+    // Get all disputes for the user
+    const disputesRef = firestore.collection('disputes');
+    const disputesSnap = await disputesRef
+      .where('challengerId', '==', req.user.uid)
+      .where('status', 'in', ['pending', 'under_review'])
+      .get();
+
+    const activeDisputes = new Set();
+    disputesSnap.forEach(doc => {
+      const data = doc.data();
+      if (challengeIds.includes(data.challengeId)) {
+        activeDisputes.add(data.challengeId);
+      }
+    });
+
+    // Also check disputes where user is opponent
+    const opponentDisputesSnap = await disputesRef
+      .where('opponentId', '==', req.user.uid)
+      .where('status', 'in', ['pending', 'under_review'])
+      .get();
+
+    opponentDisputesSnap.forEach(doc => {
+      const data = doc.data();
+      if (challengeIds.includes(data.challengeId)) {
+        activeDisputes.add(data.challengeId);
+      }
+    });
+
+    // Create response object
+    const disputeStatus = {};
+    challengeIds.forEach(challengeId => {
+      disputeStatus[challengeId] = activeDisputes.has(challengeId);
+    });
+
+    console.log(`✅ Bulk dispute check completed for ${challengeIds.length} challenges`);
+
+    res.json({
+      success: true,
+      data: disputeStatus
+    });
+
+  } catch (error) {
+    console.error('❌ Error in bulk dispute check:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to check dispute status',
       error: error.message
     });
   }
@@ -1422,12 +1558,42 @@ router.post('/submit-proof', authenticateToken, async (req, res) => {
         aiWinner,
         winnerUserId,
         rewardAmount,
-        adminFee
+        adminFee,
+        challengeId
       });
-      await walletService.awardReward(winnerUserId, rewardAmount, challengeId, `Challenge reward for ${challengeData.game}`);
-      await walletService.addAdminFee(adminFee, challengeId, `Admin fee from challenge ${challengeData.game}`);
+      
+      try {
+        await walletService.awardReward(winnerUserId, rewardAmount, challengeId, `Challenge reward for ${challengeData.game}`);
+        await walletService.addAdminFee(adminFee, challengeId, `Admin fee from challenge ${challengeData.game}`);
+        console.log('✅ Winner credited successfully:', {
+          challengeId,
+          winnerUserId,
+          rewardAmount,
+          adminFee,
+          game: challengeData.game
+        });
+      } catch (walletError) {
+        console.error('❌ Error crediting winner wallet:', walletError);
+        // Don't fail the entire request if wallet credit fails
+        // The challenge is already marked as completed
+      }
     } else {
-      console.warn('⚠️ Winner user not resolved; skipping wallet credit. aiResult.winner:', aiWinner, 'iWin:', aiResult?.iWin);
+      console.error('❌ CRITICAL: Winner user not resolved; no wallet credit will be given!', {
+        challengeId,
+        aiWinner,
+        iWin: aiResult?.iWin,
+        aiResult,
+        challengerUsername: challengeData?.challenger?.username,
+        opponentUsernames: challengeData.opponents?.map(o => o.username),
+        challengerPlatforms: challengeData?.challengerPlatformUsernames
+      });
+      
+      // Return error to prevent completion without reward distribution
+      return res.status(400).json({
+        success: false,
+        message: 'Unable to resolve winner for reward distribution. Please contact support.',
+        error: 'Winner resolution failed'
+      });
     }
     
     console.log('✅ Proof processed and AI analysis completed for challenge:', challengeId);
@@ -2354,8 +2520,12 @@ router.post('/:id/complete', authenticateToken, async (req, res) => {
     const { id } = req.params;
     const { aiResult, completedAt } = req.body;
 
-    console.log('🎯 Marking challenge as completed:', id);
-    console.log('🎯 AI Result:', aiResult);
+    console.log('🎯 ===== CHALLENGE COMPLETION REQUEST =====');
+    console.log('🎯 Challenge ID:', id);
+    console.log('🎯 User:', req.user.username, '(UID:', req.user.uid, ')');
+    console.log('🎯 AI Result:', JSON.stringify(aiResult, null, 2));
+    console.log('🎯 Completed At:', completedAt);
+    console.log('🎯 Request Body:', JSON.stringify(req.body, null, 2));
 
     const challengeRef = firestore.collection('challenges').doc(id);
     const challengeDoc = await challengeRef.get();
@@ -2401,48 +2571,83 @@ router.post('/:id/complete', authenticateToken, async (req, res) => {
 
     await challengeRef.update(updateData);
 
-    // After persisting completion, process wallet credit for the actual winner
+    // Process reward distribution for AI verification results
     try {
       const totalChallengeAmount = (challengeData.stake || 0) * 2;
       const rewardAmount = totalChallengeAmount * 0.95;
       const adminFee = totalChallengeAmount * 0.05;
 
+      console.log('💰 Processing reward distribution in /complete endpoint:', {
+        challengeId: id,
+        totalChallengeAmount,
+        rewardAmount,
+        adminFee,
+        aiResult: aiResult,
+        stake: challengeData.stake
+      });
+
       let winnerUserId = null;
       const aiWinner = aiResult?.winner || '';
       const aiWinnerLower = aiWinner.toLowerCase().trim();
 
+      console.log('🔍 Winner resolution process in /complete:', {
+        aiWinner,
+        aiWinnerLower,
+        iWin: aiResult?.iWin,
+        currentUser: req.user.username,
+        currentUserId: req.user.uid
+      });
+
+      // Method 1: Check if current user won (iWin flag)
       if (aiResult?.iWin === true) {
         winnerUserId = req.user.uid;
+        console.log('✅ Winner resolved via iWin flag:', winnerUserId);
       }
+      
+      // Method 2: Match by challenger username
       if (!winnerUserId && aiWinnerLower) {
         if (challengeData?.challenger?.username && challengeData.challenger.username.toLowerCase().trim() === aiWinnerLower) {
           winnerUserId = challengeData.challenger.uid;
+          console.log('✅ Winner resolved via challenger username match:', winnerUserId);
         }
       }
+      
+      // Method 3: Match by opponent username
       if (!winnerUserId && aiWinnerLower && Array.isArray(challengeData.opponents)) {
         const matchedOpp = challengeData.opponents.find(opp => opp?.username && opp.username.toLowerCase().trim() === aiWinnerLower);
         if (matchedOpp) {
           try {
             const profile = await userService.getUserByUsername(matchedOpp.username);
-            if (profile?.uid) winnerUserId = profile.uid;
-          } catch {}
+            if (profile?.uid) {
+              winnerUserId = profile.uid;
+              console.log('✅ Winner resolved via opponent username match:', winnerUserId);
+            }
+          } catch (err) {
+            console.error('❌ Error resolving opponent username:', err);
+          }
         }
       }
-      // Match platform usernames
+      
+      // Method 4: Match platform usernames for challenger
       if (!winnerUserId && aiWinnerLower) {
         const challengerPlatforms = challengeData?.challengerPlatformUsernames || {};
+        console.log('🔍 Checking challenger platform usernames:', challengerPlatforms);
         for (const key of Object.keys(challengerPlatforms)) {
           const val = (challengerPlatforms[key] || '').toLowerCase().trim();
           if (!val) continue;
           if (val === aiWinnerLower || val.includes(aiWinnerLower) || aiWinnerLower.includes(val)) {
             winnerUserId = challengeData.challenger.uid;
+            console.log('✅ Winner resolved via challenger platform username match:', winnerUserId, 'Platform:', key, 'Value:', val);
             break;
           }
         }
       }
+      
+      // Method 5: Match platform usernames for opponents
       if (!winnerUserId && Array.isArray(challengeData.opponents)) {
         for (const opp of challengeData.opponents) {
           const oppPlatforms = opp?.accepterPlatformUsernames || opp?.platformUsernames || {};
+          console.log('🔍 Checking opponent platform usernames for', opp.username, ':', oppPlatforms);
           const keys = Object.keys(oppPlatforms || {});
           for (const key of keys) {
             const val = (oppPlatforms[key] || '').toLowerCase().trim();
@@ -2450,31 +2655,74 @@ router.post('/:id/complete', authenticateToken, async (req, res) => {
             if (val === aiWinnerLower || val.includes(aiWinnerLower) || aiWinnerLower.includes(val)) {
               try {
                 const profile = await userService.getUserByUsername(opp.username);
-                if (profile?.uid) winnerUserId = profile.uid;
-              } catch {}
+                if (profile?.uid) {
+                  winnerUserId = profile.uid;
+                  console.log('✅ Winner resolved via opponent platform username match:', winnerUserId, 'Platform:', key, 'Value:', val);
+                }
+              } catch (err) {
+                console.error('❌ Error resolving opponent platform username:', err);
+              }
               break;
             }
           }
           if (winnerUserId) break;
         }
       }
-      // Global platform search
+      
+      // Method 6: Global platform search
       if (!winnerUserId && aiWinnerLower) {
         try {
           const platformProfile = await userService.getUserByPlatformUsername(aiWinner);
-          if (platformProfile?.uid) winnerUserId = platformProfile.uid;
-        } catch {}
+          if (platformProfile?.uid) {
+            winnerUserId = platformProfile.uid;
+            console.log('✅ Winner resolved via global platform search:', winnerUserId);
+          }
+        } catch (err) {
+          console.error('❌ Error in global platform search:', err);
+        }
       }
+
+      console.log('🎯 Final winner resolution result in /complete:', {
+        winnerUserId,
+        aiWinner,
+        challengeId: id
+      });
 
       if (winnerUserId) {
         await walletService.awardReward(winnerUserId, rewardAmount, id, `Challenge reward for ${challengeData.game}`);
         await walletService.addAdminFee(adminFee, id, `Admin fee from challenge ${challengeData.game}`);
-        console.log('💰 Winner credited in /complete route:', { id, winnerUserId, rewardAmount, adminFee });
+        console.log('✅ Winner credited successfully in /complete:', { 
+          challengeId: id, 
+          winnerUserId, 
+          rewardAmount, 
+          adminFee,
+          game: challengeData.game
+        });
       } else {
-        console.warn('⚠️ Winner not resolved in /complete route; no wallet credit');
+        console.error('❌ CRITICAL: Winner not resolved in /complete - no wallet credit will be given!', {
+          challengeId: id,
+          aiWinner,
+          aiResult,
+          challengerUsername: challengeData?.challenger?.username,
+          opponentUsernames: challengeData.opponents?.map(o => o.username),
+          challengerPlatforms: challengeData?.challengerPlatformUsernames
+        });
+        
+        // Don't mark as completed if we can't resolve the winner
+        return res.status(400).json({
+          success: false,
+          message: 'Unable to resolve winner for reward distribution. Please contact support.',
+          error: 'Winner resolution failed'
+        });
       }
     } catch (creditErr) {
       console.error('❌ Error crediting winner in /complete route:', creditErr);
+      // Don't mark as completed if reward distribution fails
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to distribute rewards. Please contact support.',
+        error: creditErr.message
+      });
     }
 
     res.json({
@@ -3547,6 +3795,234 @@ router.get('/', (req, res) => {
     ],
     timestamp: new Date().toISOString()
   });
+});
+
+// Claim reward for already completed challenge
+router.post('/:id/claim-reward', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { winner } = req.body;
+
+    console.log('🎯 ===== CLAIM REWARD REQUEST =====');
+    console.log('🎯 Challenge ID:', id);
+    console.log('🎯 User:', req.user.username, '(UID:', req.user.uid, ')');
+    console.log('🎯 Winner:', winner);
+
+    const challengeRef = firestore.collection('challenges').doc(id);
+    const challengeDoc = await challengeRef.get();
+
+    if (!challengeDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        message: 'Challenge not found'
+      });
+    }
+
+    const challengeData = challengeDoc.data();
+    
+    console.log('🎯 Challenge Data:', {
+      id: id,
+      status: challengeData.status,
+      stake: challengeData.stake,
+      game: challengeData.game,
+      challenger: challengeData.challenger,
+      opponents: challengeData.opponents,
+      winner: challengeData.winner
+    });
+
+    // Check if challenge is completed
+    if (challengeData.status !== 'completed') {
+      return res.status(400).json({
+        success: false,
+        message: 'Challenge is not completed yet'
+      });
+    }
+
+    // Check if user is part of this challenge
+    const isChallenger = challengeData.challenger.uid === req.user.uid;
+    const isOpponent = challengeData.opponents && challengeData.opponents.some(opp => 
+      opp.username === req.user.username
+    );
+    
+    console.log('🎯 User Authorization:', {
+      isChallenger,
+      isOpponent,
+      currentUser: req.user.username,
+      challengerUsername: challengeData.challenger?.username
+    });
+
+    if (!isChallenger && !isOpponent) {
+      return res.status(403).json({
+        success: false,
+        message: 'You are not authorized to claim reward for this challenge'
+      });
+    }
+
+    // Check if reward has already been claimed
+    if (challengeData.rewardClaimed) {
+      return res.status(400).json({
+        success: false,
+        message: 'Reward has already been claimed for this challenge'
+      });
+    }
+
+    // Process reward distribution
+    try {
+      const totalChallengeAmount = (challengeData.stake || 0) * 2;
+      const rewardAmount = totalChallengeAmount * 0.95;
+      const adminFee = totalChallengeAmount * 0.05;
+
+      console.log('💰 Processing reward distribution in /claim-reward endpoint:', {
+        challengeId: id,
+        totalChallengeAmount,
+        rewardAmount,
+        adminFee,
+        stake: challengeData.stake
+      });
+
+      // Determine winner user ID
+      let winnerUserId = null;
+      const challengeWinner = challengeData.winner || winner || '';
+      const challengeWinnerLower = challengeWinner.toLowerCase().trim();
+
+      console.log('🔍 Winner resolution process in /claim-reward:', {
+        challengeWinner,
+        challengeWinnerLower,
+        currentUser: req.user.username,
+        currentUserId: req.user.uid
+      });
+
+      // Method 1: Check if current user is the winner
+      if (isChallenger && challengeData.challenger?.username?.toLowerCase().trim() === challengeWinnerLower) {
+        winnerUserId = req.user.uid;
+        console.log('✅ Winner resolved via challenger match:', winnerUserId);
+      } else if (isOpponent) {
+        // Check if any opponent matches the winner
+        const matchedOpp = challengeData.opponents.find(opp => 
+          opp?.username && opp.username.toLowerCase().trim() === challengeWinnerLower
+        );
+        if (matchedOpp) {
+          try {
+            const profile = await userService.getUserByUsername(matchedOpp.username);
+            if (profile?.uid) {
+              winnerUserId = profile.uid;
+              console.log('✅ Winner resolved via opponent match:', winnerUserId);
+            }
+          } catch (err) {
+            console.error('❌ Error resolving opponent username:', err);
+          }
+        }
+      }
+
+      // Method 2: Platform username matching
+      if (!winnerUserId && challengeWinnerLower) {
+        // Check challenger platform usernames
+        const challengerPlatforms = challengeData?.challengerPlatformUsernames || {};
+        for (const key of Object.keys(challengerPlatforms)) {
+          const val = (challengerPlatforms[key] || '').toLowerCase().trim();
+          if (!val) continue;
+          if (val === challengeWinnerLower || val.includes(challengeWinnerLower) || challengeWinnerLower.includes(val)) {
+            winnerUserId = challengeData.challenger.uid;
+            console.log('✅ Winner resolved via challenger platform username match:', winnerUserId, 'Platform:', key, 'Value:', val);
+            break;
+          }
+        }
+
+        // Check opponent platform usernames
+        if (!winnerUserId && Array.isArray(challengeData.opponents)) {
+          for (const opp of challengeData.opponents) {
+            const oppPlatforms = opp?.accepterPlatformUsernames || opp?.platformUsernames || {};
+            const keys = Object.keys(oppPlatforms || {});
+            for (const key of keys) {
+              const val = (oppPlatforms[key] || '').toLowerCase().trim();
+              if (!val) continue;
+              if (val === challengeWinnerLower || val.includes(challengeWinnerLower) || challengeWinnerLower.includes(val)) {
+                try {
+                  const profile = await userService.getUserByUsername(opp.username);
+                  if (profile?.uid) {
+                    winnerUserId = profile.uid;
+                    console.log('✅ Winner resolved via opponent platform username match:', winnerUserId, 'Platform:', key, 'Value:', val);
+                  }
+                } catch (err) {
+                  console.error('❌ Error resolving opponent platform username:', err);
+                }
+                break;
+              }
+            }
+            if (winnerUserId) break;
+          }
+        }
+      }
+
+      console.log('🎯 Final winner resolution result in /claim-reward:', {
+        winnerUserId,
+        challengeWinner,
+        challengeId: id
+      });
+
+      if (winnerUserId) {
+        // Award the reward
+        await walletService.awardReward(winnerUserId, rewardAmount, id, `Challenge reward for ${challengeData.game}`);
+        await walletService.addAdminFee(adminFee, id, `Admin fee from challenge ${challengeData.game}`);
+        
+        // Mark reward as claimed
+        await challengeRef.update({
+          rewardClaimed: true,
+          rewardClaimedAt: new Date(),
+          rewardClaimedBy: req.user.uid,
+          updatedAt: new Date()
+        });
+        
+        console.log('✅ Winner credited successfully in /claim-reward:', {
+          challengeId: id,
+          winnerUserId,
+          rewardAmount,
+          adminFee,
+          game: challengeData.game
+        });
+
+        res.json({
+          success: true,
+          message: 'Reward claimed successfully',
+          data: {
+            id: id,
+            rewardAmount: rewardAmount,
+            adminFee: adminFee,
+            winnerUserId: winnerUserId
+          }
+        });
+      } else {
+        console.error('❌ CRITICAL: Winner not resolved in /claim-reward - no wallet credit will be given!', {
+          challengeId: id,
+          challengeWinner,
+          challengerUsername: challengeData?.challenger?.username,
+          opponentUsernames: challengeData.opponents?.map(o => o.username),
+          challengerPlatforms: challengeData?.challengerPlatformUsernames
+        });
+
+        return res.status(400).json({
+          success: false,
+          message: 'Unable to resolve winner for reward distribution. Please contact support.',
+          error: 'Winner resolution failed'
+        });
+      }
+    } catch (creditErr) {
+      console.error('❌ Error crediting winner in /claim-reward route:', creditErr);
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to distribute rewards. Please contact support.',
+        error: creditErr.message
+      });
+    }
+
+  } catch (error) {
+    console.error('❌ Error claiming reward:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to claim reward',
+      error: error.message
+    });
+  }
 });
 
 module.exports = router;
