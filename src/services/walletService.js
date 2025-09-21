@@ -683,6 +683,159 @@ class WalletService {
       throw error;
     }
   }
+
+  // Process tournament entry fee deduction
+  async processTournamentEntry(userId, entryFee, tournamentId) {
+    try {
+      console.log(`💰 Processing tournament entry fee: ${entryFee} for user ${userId}`);
+      
+      const userRef = firestore.collection('users').doc(userId);
+      const userDoc = await userRef.get();
+      
+      if (!userDoc.exists) {
+        throw new Error('User not found');
+      }
+      
+      const userData = userDoc.data();
+      const currentBalance = userData.wallet || 0;
+      
+      if (currentBalance < entryFee) {
+        throw new Error('Insufficient funds for tournament entry');
+      }
+      
+      const newBalance = currentBalance - entryFee;
+      
+      // Update user wallet
+      await userRef.update({
+        wallet: newBalance,
+        updatedAt: new Date()
+      });
+      
+      // Create transaction record
+      await firestore.collection('transactions').add({
+        userId,
+        type: 'tournament_entry',
+        amount: entryFee,
+        balance: newBalance,
+        description: `Tournament entry fee - Tournament ${tournamentId}`,
+        status: 'completed',
+        createdAt: new Date(),
+        tournamentId
+      });
+      
+      console.log(`✅ Tournament entry fee processed: ${entryFee} deducted from user ${userId}`);
+      
+      return {
+        success: true,
+        newBalance,
+        entryFee
+      };
+    } catch (error) {
+      console.error('❌ Error processing tournament entry:', error);
+      throw error;
+    }
+  }
+
+  // Process tournament reward distribution
+  async processTournamentReward(tournamentId, winnerId, tournament) {
+    try {
+      console.log(`🏆 Processing tournament reward for winner ${winnerId}`);
+      
+      const totalPrize = tournament.participants.length * tournament.entryFee;
+      const winnerReward = Math.floor(totalPrize * tournament.winnerReward);
+      const adminReward = Math.floor(totalPrize * tournament.adminReward);
+      
+      console.log(`💰 Prize distribution: Total=${totalPrize}, Winner=${winnerReward}, Admin=${adminReward}`);
+      
+      // Award winner
+      await this.awardReward(winnerId, winnerReward, `Tournament ${tournamentId} winner prize`);
+      
+      // Award admin
+      await this.addAdminFee(adminReward, `Tournament ${tournamentId} admin fee`);
+      
+      // Create tournament completion record
+      await firestore.collection('tournamentRewards').add({
+        tournamentId,
+        winnerId,
+        totalPrize,
+        winnerReward,
+        adminReward,
+        participants: tournament.participants.length,
+        completedAt: new Date()
+      });
+      
+      console.log(`✅ Tournament reward processed: Winner received ${winnerReward}, Admin received ${adminReward}`);
+      
+      return {
+        success: true,
+        totalPrize,
+        winnerReward,
+        adminReward
+      };
+    } catch (error) {
+      console.error('❌ Error processing tournament reward:', error);
+      throw error;
+    }
+  }
+
+  // Refund tournament entry fee
+  async refundTournamentEntry(userId, entryFee, tournamentId) {
+    try {
+      console.log(`💸 Refunding tournament entry fee: ${entryFee} to user ${userId}`);
+      
+      const userRef = firestore.collection('users').doc(userId);
+      const userDoc = await userRef.get();
+      
+      if (!userDoc.exists) {
+        throw new Error('User not found');
+      }
+      
+      const userData = userDoc.data();
+      const currentBalance = userData.wallet || 0;
+      const newBalance = currentBalance + entryFee;
+      
+      // Update user wallet
+      await userRef.update({
+        wallet: newBalance,
+        updatedAt: new Date()
+      });
+      
+      // Create transaction record
+      await firestore.collection('transactions').add({
+        userId,
+        type: 'tournament_refund',
+        amount: entryFee,
+        balance: newBalance,
+        description: `Tournament entry refund - Tournament ${tournamentId}`,
+        status: 'completed',
+        createdAt: new Date(),
+        tournamentId
+      });
+      
+      console.log(`✅ Tournament entry refunded: ${entryFee} added to user ${userId}`);
+      
+      return {
+        success: true,
+        newBalance,
+        refundAmount: entryFee
+      };
+    } catch (error) {
+      console.error('❌ Error refunding tournament entry:', error);
+      throw error;
+    }
+  }
 }
 
-module.exports = { WalletService };
+const walletService = new WalletService();
+
+module.exports = { 
+  WalletService,
+  processChallengeCompletion: walletService.processChallengeCompletion.bind(walletService),
+  awardReward: walletService.awardReward.bind(walletService),
+  addAdminFee: walletService.addAdminFee.bind(walletService),
+  refundStake: walletService.refundStake.bind(walletService),
+  processWithdrawal: walletService.processWithdrawal.bind(walletService),
+  processTournamentEntry: walletService.processTournamentEntry.bind(walletService),
+  processTournamentReward: walletService.processTournamentReward.bind(walletService),
+  refundTournamentEntry: walletService.refundTournamentEntry.bind(walletService)
+};

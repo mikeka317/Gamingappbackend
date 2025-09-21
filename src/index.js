@@ -18,6 +18,9 @@ const aiVerificationRoutes = require('./routes/ai-verification');
 const helperRoutes = require('./routes/helpers');
 const gameRoutes = require('./routes/games');
 const stripeRoutes = require('./routes/stripe');
+const userRoutes = require('./routes/users');
+const tournamentRoutes = require('./routes/tournaments');
+const tournamentTypesRoutes = require('./routes/tournament-types');
 
 // Load environment variables
 
@@ -109,6 +112,9 @@ app.use('/api/ai-verification', aiVerificationRoutes);
 app.use('/api/stripe', stripeRoutes);
 app.use('/api/helpers', helperRoutes);
 app.use('/api/games', gameRoutes);
+app.use('/api/users', userRoutes);
+app.use('/api/tournaments', tournamentRoutes);
+app.use('/api/tournament-types', tournamentTypesRoutes);
 
 // Debug: Log registered routes
 // console.log('🔗 Registered API routes:');

@@ -4026,3 +4026,4 @@ router.post('/:id/claim-reward', authenticateToken, async (req, res) => {
 });
 
 module.exports = router;
+module.exports.performAIAnalysis = performAIAnalysis;
